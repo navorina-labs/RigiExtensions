@@ -1,4 +1,4 @@
-# Update Swiss Extensions without losing tabs
+# Update Rigi Extensions without losing tabs
 
 Suspended placeholder tabs belong to a specific extension installation. A manual removal or reinstall can change the unpacked extension ID, making placeholders from the previous installation unavailable. Back up your tabs before updating.
 
@@ -9,7 +9,7 @@ Suspended placeholder tabs belong to a specific extension installation. A manual
 3. Optionally select **Restore all** to turn placeholders back into normal tabs, then create one more backup.
 4. Only after the backup completes, reload or reinstall the extension from `chrome://extensions/`.
 
-Swiss Extensions also creates an automatic snapshot before supported updates. Recovery searches local extension storage and the **Tab Hibernate → Emergency Recovery** and **Tab Backup** bookmark folders.
+Rigi Extensions also creates an automatic snapshot before supported updates. Recovery searches local extension storage and the **Tab Hibernate → Emergency Recovery** and **Tab Backup** bookmark folders.
 
 ## Recover tabs after an update
 
@@ -24,7 +24,7 @@ If suspended tabs were closed or their placeholders no longer work:
 
 - Open **Tab Hibernate → History** and check the saved tab list.
 - Check the **Emergency Recovery** and **Tab Backup** bookmark folders.
-- If the extension is disabled, open `chrome://extensions/`, enable Swiss Extensions, and select **Reload**.
+- If the extension is disabled, open `chrome://extensions/`, enable Rigi Extensions, and select **Reload**.
 - Restore very large sessions in batches to avoid loading hundreds of pages simultaneously.
 
 ## Important limitations

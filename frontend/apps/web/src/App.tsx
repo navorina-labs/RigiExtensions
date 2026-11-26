@@ -16,8 +16,9 @@ import {
 } from "iconoir-react"
 
 import creatorPortrait from "./assets/creator-portrait.jpg"
+import logoMark from "./assets/rigi-mark.svg"
 
-const SWISS_VERSION = "1.5.50"
+const EXTENSIONS_VERSION = "1.5.52"
 const STORE_URL =
   "https://chromewebstore.google.com/detail/obemilbkkamjohnlhlbmcmnoifojhjip?utm_source=item-share-cb"
 const GITHUB_URL = "https://github.com/navorina-labs/SwissExtensions"
@@ -109,16 +110,8 @@ const downloads = [
 function Brand() {
   return (
     <span className="brand-lockup">
-      <svg
-        className="brand-flag"
-        viewBox="0 0 32 32"
-        aria-hidden="true"
-        focusable="false"
-      >
-        <rect width="32" height="32" rx="5" fill="currentColor" />
-        <path d="M13 6h6v7h7v6h-7v7h-6v-7H6v-6h7V6Z" fill="white" />
-      </svg>
-      <span>Swiss Extensions</span>
+      <img className="brand-mark" src={logoMark} alt="" />
+      <span>Rigi Extensions</span>
     </span>
   )
 }
@@ -128,7 +121,7 @@ function ProductPreview() {
     <div
       className="product-preview"
       role="img"
-      aria-label="Preview of the Swiss Extensions side panel with browser tools"
+      aria-label="Preview of the Rigi Extensions side panel with browser tools"
     >
       <div className="browser-bar" aria-hidden="true">
         <span className="browser-dot" />
@@ -188,7 +181,7 @@ export function App() {
       </a>
 
       <header className="there-header">
-        <a href="/" aria-label="Swiss Extensions home">
+        <a href="/" aria-label="Rigi Extensions home">
           <Brand />
         </a>
         <a
@@ -217,9 +210,9 @@ export function App() {
             <ArrowUpRight aria-hidden="true" width={18} height={18} />
           </a>
           <p className="hero-meta">
-            Version {SWISS_VERSION} <span aria-hidden="true">|</span> Manifest V3{" "}
+            Version {EXTENSIONS_VERSION} <span aria-hidden="true">|</span> Manifest V3{" "}
             <span aria-hidden="true">|</span>{" "}
-            <a href={`/downloads/SwissExtensions-v${SWISS_VERSION}.zip`} download>
+            <a href={`/downloads/RigiExtensions-v${EXTENSIONS_VERSION}.zip`} download>
               Download ZIP
             </a>
           </p>
@@ -261,17 +254,16 @@ export function App() {
             <img
               className="about-portrait"
               src={creatorPortrait}
-              alt="Portrait of the creator of Swiss Extensions"
+              alt="Portrait of the creator of Rigi Extensions"
             />
           </div>
           <div className="about-copy">
             <p className="about-eyebrow">About the project</p>
-            <h2 id="about-title">Why I called it Swiss Extensions</h2>
+            <h2 id="about-title">Why I called it Rigi</h2>
             <p className="about-lead">
-              Switzerland has always represented a rare kind of confidence to
-              me: precision without noise. Trains arrive, typography stays
-              clear, and well-made things do their work without asking for
-              attention.
+              Mount Rigi represents the character I wanted for these tools:
+              calm, precise, and quietly present. Well-made things should do
+              their work without asking for attention.
             </p>
             <p>
               That is what I wanted from a browser extension. Not another
@@ -280,11 +272,9 @@ export function App() {
               panel.
             </p>
             <p>
-              The Alps inspired the atmosphere; Swiss design inspired the
-              restraint. Red marks what matters, the grid keeps everything in
-              place, and every feature has to earn its space. The name is less
-              about geography than a promise: useful software should feel
-              considered, private, and built to last.
+              The Alps still shape the atmosphere and Swiss design still shapes
+              the restraint. The new ridge mark gives the project a distinct
+              identity, while every feature still has to earn its space.
             </p>
             <nav className="about-links" aria-label="Creator links">
               {contactLinks.map((contact) => {
@@ -310,8 +300,8 @@ export function App() {
       </main>
 
       <footer className="there-footer">
-        <span>© 2026 Swiss Extensions</span>
-        <span>v{SWISS_VERSION}</span>
+        <span>Rigi Extensions · A Navorina Labs project</span>
+        <span>v{EXTENSIONS_VERSION}</span>
         <a href={PRIVACY_URL} target="_blank" rel="noopener noreferrer">
           Privacy
         </a>

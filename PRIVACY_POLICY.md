@@ -1,13 +1,13 @@
-# Privacy Policy for Swiss Extensions
+# Privacy Policy for Rigi Extensions
 
 Effective date: 2026-03-21
 
-Swiss Extensions is a Chrome extension focused on browser productivity (page capture, tab hibernation, memory cleanup, site blocking, and site-data clearing).
+Rigi Extensions is a Chrome extension focused on browser productivity (page capture, tab hibernation, memory cleanup, site blocking, and site-data clearing).
 
 ## Summary
 
-- Swiss Extensions does **not** sell personal data.
-- Swiss Extensions does **not** transfer personal data to third parties for advertising.
+- Rigi Extensions does **not** sell personal data.
+- Rigi Extensions does **not** transfer personal data to third parties for advertising.
 - Core functionality is processed locally in the browser.
 
 ## Data we access
@@ -32,8 +32,8 @@ Data is used only to provide user-requested features:
 
 ## Data sharing
 
-Swiss Extensions does not sell, rent, or broker user data.
-Swiss Extensions does not share user data with third parties except when required by law.
+Rigi Extensions does not sell, rent, or broker user data.
+Rigi Extensions does not share user data with third parties except when required by law.
 
 ## Data retention
 

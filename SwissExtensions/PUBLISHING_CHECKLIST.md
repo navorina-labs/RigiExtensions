@@ -1,4 +1,4 @@
-# Publishing Swiss Extensions to the Chrome Web Store
+# Publishing Rigi Extensions to the Chrome Web Store
 
 The package is configured as a Manifest V3 extension. Complete every section below before submitting a new release.
 
@@ -18,7 +18,7 @@ From the `SwissExtensions` directory, run:
 ./scripts/package-swiss-extensions-store.sh
 ```
 
-The Store archive is written to `dist/SwissExtensions-v<version>-chrome-store.zip`. The script excludes development files such as Markdown documentation, tests, scripts, `_metadata/`, and nested build artifacts.
+The Store archive is written to `dist/RigiExtensions-v<version>-chrome-store.zip`. The script excludes development files such as Markdown documentation, tests, scripts, `_metadata/`, and nested build artifacts.
 
 Verify that `manifest.json` is at the root of the ZIP and that the package contains:
 
@@ -44,7 +44,7 @@ Verify that `manifest.json` is at the root of the ZIP and that the package conta
 
 ## 4. Prepare the Store listing
 
-Use [STORE_LISTING.md](STORE_LISTING.md) as the maintained source for:
+Use [CHROMEWEBSTORE.md](CHROMEWEBSTORE.md) as the canonical source for:
 
 - the short and full descriptions
 - release notes
@@ -56,13 +56,13 @@ Also prepare the Productivity category, a support email or website, and a public
 
 ## 5. Complete privacy disclosures
 
-Swiss Extensions can access tabs, browsing history, bookmarks, site data, tab groups, and pages matching `<all_urls>`. The Store declaration must match the actual behavior of the submitted build.
+Rigi Extensions can access tabs, browsing history, bookmarks, site data, tab groups, and pages matching `<all_urls>`. The Store declaration must match the actual behavior of the submitted build.
 
 - State which browser data each feature accesses.
 - State that data is processed locally when that remains true for the submitted build.
 - State that data is not sold or transferred to third parties when that remains true.
 - Explain each requested permission in terms of a user-visible feature.
-- Use the detailed, Store-ready permission text in [STORE_LISTING.md](STORE_LISTING.md), including the explanations for `webNavigation` and `tabGroups`.
+- Use the detailed, Store-ready permission text in [CHROMEWEBSTORE.md](CHROMEWEBSTORE.md), including the explanations for `webNavigation` and `tabGroups`.
 
 ## 6. Final submission checks
 

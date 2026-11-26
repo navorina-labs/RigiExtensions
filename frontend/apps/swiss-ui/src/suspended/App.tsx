@@ -46,12 +46,14 @@ export function SuspendedApp() {
     }
   }, [url])
 
-  const applyRestoreData = (res?: {
-    url?: string
-    title?: string
-    favIconUrl?: string
-    previewDataUrl?: string
-  } | null) => {
+  const applyRestoreData = (
+    res?: {
+      url?: string
+      title?: string
+      favIconUrl?: string
+      previewDataUrl?: string
+    } | null
+  ) => {
     if (res?.url) setUrl(res.url)
     if (res?.title) setTitle(res.title)
     if (res?.favIconUrl) setFavIconUrl(res.favIconUrl)
@@ -110,7 +112,9 @@ export function SuspendedApp() {
     void restore()
   }
 
-  const visibleFavicon = faviconFailed ? fallbackFaviconUrl : favIconUrl || fallbackFaviconUrl
+  const visibleFavicon = faviconFailed
+    ? fallbackFaviconUrl
+    : favIconUrl || fallbackFaviconUrl
   const hasScreenshot = Boolean(previewDataUrl && !imageFailed)
 
   useEffect(() => {
@@ -139,6 +143,12 @@ export function SuspendedApp() {
         link.href = canvas.toDataURL("image/png")
       } catch {
         link.href = visibleFavicon
+      } finally {
+        favicon.onload = null
+        favicon.onerror = null
+        favicon.src = ""
+        canvas.width = 0
+        canvas.height = 0
       }
     }
     favicon.src = visibleFavicon
@@ -146,6 +156,8 @@ export function SuspendedApp() {
     return () => {
       cancelled = true
       favicon.onload = null
+      favicon.onerror = null
+      favicon.src = ""
     }
   }, [visibleFavicon])
 
@@ -163,7 +175,7 @@ export function SuspendedApp() {
               <img
                 src={visibleFavicon}
                 alt=""
-                className="size-16 rounded-2xl bg-background/80 p-2 opacity-75 grayscale shadow-lg"
+                className="size-16 rounded-2xl bg-background/80 p-2 opacity-75 shadow-lg grayscale"
                 onError={() => setFaviconFailed(true)}
               />
             ) : (
@@ -171,7 +183,9 @@ export function SuspendedApp() {
                 {(domain || "?").slice(0, 1)}
               </div>
             )}
-            <p className="max-w-md truncate text-lg font-medium">{domain || "Saved page"}</p>
+            <p className="max-w-md truncate text-lg font-medium">
+              {domain || "Saved page"}
+            </p>
           </div>
           {hasScreenshot ? (
             <img
@@ -188,13 +202,15 @@ export function SuspendedApp() {
               <img
                 src={visibleFavicon}
                 alt=""
-                className="size-10 rounded-xl bg-background/80 p-1.5 opacity-75 grayscale shadow-md"
+                className="size-10 rounded-xl bg-background/80 p-1.5 opacity-75 shadow-md grayscale"
                 onError={() => setFaviconFailed(true)}
               />
             ) : null}
             <div className="min-w-0 text-shadow-sm">
               <p className="text-xs text-foreground/70">Tab suspended</p>
-              <h1 className="truncate text-lg font-semibold sm:text-xl">{title}</h1>
+              <h1 className="truncate text-lg font-semibold sm:text-xl">
+                {title}
+              </h1>
             </div>
           </div>
         </div>
@@ -207,7 +223,7 @@ export function SuspendedApp() {
             </CardDescription>
           </CardHeader>
           <Button
-            className="w-full active:scale-[0.96] transition-transform"
+            className="w-full transition-transform active:scale-[0.96]"
             size="lg"
             disabled={restoring || !url}
             onClick={() => void restore()}
@@ -229,7 +245,11 @@ export function SuspendedApp() {
               </a>
             ) : null}
           </div>
-          <p role="status" aria-live="polite" className="min-h-4 text-center text-xs text-muted-foreground">
+          <p
+            role="status"
+            aria-live="polite"
+            className="min-h-4 text-center text-xs text-muted-foreground"
+          >
             {status}
           </p>
         </div>

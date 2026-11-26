@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Swiss Extensions mountain mark</title>
+  <desc id="desc">A white alpine peak on a red rounded square.</desc>
+  <rect x="16" y="16" width="96" height="96" rx="24" fill="#D52B1E"/>
+  <path d="M27 92 56 43l13 21 10-17 23 45H27Z" fill="#FFF"/>
+  <path d="m45 62 11-19 13 21 10-17 11 21-11-9-10 17-13-20-11 18-8 5 8-17Z" fill="#D52B1E"/>
+</svg>
