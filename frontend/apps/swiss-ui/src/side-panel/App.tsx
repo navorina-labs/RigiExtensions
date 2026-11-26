@@ -49,7 +49,15 @@ import {
 } from "@/lib/command-search"
 import "./side-panel.css"
 
-type View = "home" | "command" | "lens" | "capture" | "tabs" | "memory" | "blocker" | "clear"
+type View =
+  | "home"
+  | "command"
+  | "lens"
+  | "capture"
+  | "tabs"
+  | "memory"
+  | "blocker"
+  | "clear"
 
 type LensSettings = {
   enabled: boolean
@@ -69,9 +77,196 @@ type Settings = {
   skipGroupedInHibernate: boolean
   smartRulesEnabled: boolean
   smartDefaultMode: string
-  smartHeuristicsFallback: boolean
+  smartUseHeuristicsFallback: boolean
   smartPlaceholderDomains: string
   smartDiscardDomains: string
+}
+
+type FaviconRefreshProgress = {
+  status: "running" | "complete" | "error"
+  done: number
+  total: number
+  refreshed: number
+  failed: number
+  remaining: number
+  skippedActive: number
+  error?: string
+}
+
+const PANEL_FAVICON_REFRESH_TIMEOUT_MS = 6000
+const PANEL_FAVICON_REFRESH_TAB_DELAY_MS = 1500
+const PANEL_FAVICON_REFRESH_PARAM = "faviconRefresh"
+
+function isPanelSuspendedTabUrl(value: string | undefined) {
+  const url = String(value || "")
+  return ["ui-dist/suspended.html", "suspended.html"].some((path) => {
+    const base = chrome.runtime.getURL(path)
+    return (
+      url === base || url.startsWith(`${base}?`) || url.startsWith(`${base}#`)
+    )
+  })
+}
+
+function isMonochromeFaviconReady(value: string | undefined) {
+  return String(value || "").startsWith("data:image/")
+}
+
+function getPanelFaviconRefreshUrl(value: string) {
+  const url = new URL(value)
+  url.searchParams.set(PANEL_FAVICON_REFRESH_PARAM, "1")
+  return url.toString()
+}
+
+function waitForPanelFavicon(tabId: number) {
+  return new Promise<boolean>((resolve) => {
+    let settled = false
+    const finish = (ready: boolean) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timer)
+      chrome.tabs.onUpdated.removeListener(onUpdated)
+      resolve(ready)
+    }
+    const onUpdated = (
+      updatedTabId: number,
+      changeInfo: { favIconUrl?: string },
+      tab: chrome.tabs.Tab
+    ) => {
+      if (updatedTabId !== tabId) return
+      if (isMonochromeFaviconReady(changeInfo.favIconUrl || tab.favIconUrl)) {
+        finish(true)
+      }
+    }
+    const timer = window.setTimeout(
+      () => finish(false),
+      PANEL_FAVICON_REFRESH_TIMEOUT_MS
+    )
+    chrome.tabs.onUpdated.addListener(onUpdated)
+    void chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        if (isMonochromeFaviconReady(tab.favIconUrl)) finish(true)
+      })
+      .catch(() => finish(false))
+  })
+}
+
+async function yieldPanelTask() {
+  const taskScheduler = (
+    globalThis as typeof globalThis & {
+      scheduler?: { yield?: () => Promise<void> }
+    }
+  ).scheduler
+  if (taskScheduler?.yield) {
+    await taskScheduler.yield()
+    return
+  }
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+}
+
+function waitBetweenPanelTabs(delayMs: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, delayMs))
+}
+
+async function getPanelFaviconQueue() {
+  const tabs = await chrome.tabs.query({})
+  const tabIds: number[] = []
+  let skippedActive = 0
+  for (const tab of tabs) {
+    if (
+      !Number.isInteger(tab.id) ||
+      !isPanelSuspendedTabUrl(tab.url) ||
+      isMonochromeFaviconReady(tab.favIconUrl)
+    ) {
+      continue
+    }
+    if (tab.active) skippedActive += 1
+    else tabIds.push(tab.id as number)
+  }
+  // Do not retain Chrome's full Tab objects during the long-running queue.
+  tabs.length = 0
+  return {
+    tabIds,
+    skippedActive,
+  }
+}
+
+async function refreshSuspendedFaviconsInPanel(
+  onProgress: (progress: FaviconRefreshProgress) => void
+) {
+  const queue = await getPanelFaviconQueue()
+  const pendingTabIds = queue.tabIds
+  const total = pendingTabIds.length
+  let skippedActive = queue.skippedActive
+  let refreshed = 0
+  let failed = 0
+
+  onProgress({
+    status: total ? "running" : "complete",
+    done: 0,
+    total,
+    refreshed,
+    failed,
+    remaining: total,
+    skippedActive,
+  })
+
+  for (let index = 0; index < pendingTabIds.length; index += 1) {
+    const maybeTabId = pendingTabIds[index]
+    if (!Number.isInteger(maybeTabId)) continue
+    const tabId = maybeTabId as number
+    pendingTabIds[index] = 0
+    try {
+      const tab = await chrome.tabs.get(tabId)
+      if (tab.active) {
+        skippedActive += 1
+      } else if (!isPanelSuspendedTabUrl(tab.url)) {
+        failed += 1
+      } else {
+        const faviconReady = waitForPanelFavicon(tabId)
+        await chrome.tabs.update(tabId, {
+          url: getPanelFaviconRefreshUrl(tab.url || ""),
+        })
+        if (await faviconReady) refreshed += 1
+        else failed += 1
+      }
+    } catch {
+      failed += 1
+    } finally {
+      try {
+        const fresh = await chrome.tabs.get(tabId)
+        if (fresh.active && isPanelSuspendedTabUrl(fresh.url)) {
+          // If the user opens the tab mid-refresh, immediately load its normal
+          // suspended UI instead of leaving the lightweight document visible.
+          await chrome.tabs.reload(tabId)
+        } else if (
+          !fresh.active &&
+          !fresh.discarded &&
+          isPanelSuspendedTabUrl(fresh.url)
+        ) {
+          await chrome.tabs.discard(tabId)
+        }
+      } catch {
+        // The tab may have been closed while its icon was loading.
+      }
+    }
+
+    const done = index + 1
+    const complete = done === total
+    onProgress({
+      status: complete ? "complete" : "running",
+      done,
+      total,
+      refreshed,
+      failed,
+      remaining: Math.max(0, total - done),
+      skippedActive,
+    })
+    await yieldPanelTask()
+    if (!complete) {
+      await waitBetweenPanelTabs(PANEL_FAVICON_REFRESH_TAB_DELAY_MS)
+    }
+  }
 }
 
 type TmcSettings = {
@@ -99,7 +294,7 @@ const defaultSettings: Settings = {
   skipGroupedInHibernate: false,
   smartRulesEnabled: false,
   smartDefaultMode: "discard",
-  smartHeuristicsFallback: true,
+  smartUseHeuristicsFallback: true,
   smartPlaceholderDomains: "",
   smartDiscardDomains: "",
 }
@@ -176,14 +371,28 @@ function textToLines(text: string) {
 
 export function SidePanelApp() {
   const [view, setView] = useState<View>("home")
+  const returnFocusView = useRef<View | null>(null)
+  const open = (next: View) => {
+    returnFocusView.current = next
+    setView(next)
+  }
   const back = () => setView("home")
+
+  useEffect(() => {
+    if (view !== "home" || !returnFocusView.current) return
+    const trigger = document.querySelector<HTMLButtonElement>(
+      `[data-tool-view="${returnFocusView.current}"]`
+    )
+    returnFocusView.current = null
+    trigger?.focus()
+  }, [view])
 
   return (
     <div className="swiss-extension-stage flex h-svh w-full min-w-0 text-xs text-[#202020] [--accent-foreground:#202020] [--accent:#ededeb] [--background:#f8f8f7] [--border:#dededb] [--card-foreground:#202020] [--card:#ffffff] [--foreground:#202020] [--input:#d6d6d2] [--muted-foreground:#73736f] [--muted:#eeeeec] [--primary-foreground:#ffffff] [--primary:#d52b1e] [--ring:#d52b1e] [--secondary-foreground:#202020] [--secondary:#e9e9e6]">
       <div
         className={`swiss-panel ${view === "home" ? "swiss-panel-home" : "swiss-panel-detail"} flex min-h-0 min-w-0 flex-col overflow-hidden`}
       >
-        {view === "home" && <HomeView onOpen={setView} />}
+        {view === "home" && <HomeView onOpen={open} />}
         {view === "command" && <CommandView onBack={back} />}
         {view === "lens" && <LensView onBack={back} />}
         {view === "capture" && <CaptureView onBack={back} />}
@@ -196,14 +405,10 @@ export function SidePanelApp() {
   )
 }
 
-function HomeView({
-  onOpen,
-}: {
-  onOpen: (v: View) => void
-}) {
+function HomeView({ onOpen }: { onOpen: (v: View) => void }) {
   return (
     <main className="swiss-scroll flex-1 overflow-y-auto p-3">
-      <h1 className="sr-only">Swiss Extensions tools</h1>
+      <h1 className="sr-only">Rigi Extensions tools</h1>
       <div className="home-shell">
         <div className="tool-island-grid">
           {blocks.map((b, index) => {
@@ -213,8 +418,9 @@ function HomeView({
               <button
                 key={b.id}
                 type="button"
+                data-tool-view={b.id}
                 onClick={() => onOpen(b.id)}
-                className={`tool-island group${blocks.length % 2 === 1 && index === blocks.length - 1 ? " tool-island-wide" : ""}`}
+                className={`tool-island group${blocks.length % 2 === 1 && index === blocks.length - 1 ? "tool-island-wide" : ""}`}
               >
                 <span aria-hidden="true" className="tool-island-icon">
                   <Icon className="size-5" />
@@ -223,7 +429,7 @@ function HomeView({
                   <span className="block text-[14px] leading-snug font-semibold tracking-[-0.015em]">
                     {b.title}
                   </span>
-                  <span className="mt-1 block text-[12px] leading-[1.35] text-muted-foreground text-pretty">
+                  <span className="mt-1 block text-[12px] leading-[1.35] text-pretty text-muted-foreground">
                     {b.description}
                   </span>
                 </span>
@@ -259,10 +465,13 @@ function CommandView({ onBack }: { onBack: () => void }) {
           if (!current) return
           setResults(next)
           setSelected(0)
-          setStatus(next.length ? `${next.length} results` : "No matching results")
+          setStatus(
+            next.length ? `${next.length} results` : "No matching results"
+          )
         })
         .catch((error) => {
-          if (current) setStatus(error instanceof Error ? error.message : String(error))
+          if (current)
+            setStatus(error instanceof Error ? error.message : String(error))
         })
     }, 90)
     return () => {
@@ -284,7 +493,10 @@ function CommandView({ onBack }: { onBack: () => void }) {
       <PanelHeader title="Swiss Command" onBack={onBack} />
       <main className="command-workspace swiss-scroll flex min-h-0 flex-1 flex-col overflow-hidden p-4">
         <div className="command-search-wrap">
-          <Search aria-hidden="true" className="size-[19px] shrink-0 text-muted-foreground" />
+          <Search
+            aria-hidden="true"
+            className="size-[19px] shrink-0 text-muted-foreground"
+          />
           <label htmlFor="swiss-command-search" className="sr-only">
             Search open tabs, bookmarks, and history
           </label>
@@ -296,7 +508,9 @@ function CommandView({ onBack }: { onBack: () => void }) {
             aria-autocomplete="list"
             aria-controls="swiss-command-results"
             aria-expanded="true"
-            aria-activedescendant={results[selected] ? `swiss-command-result-${selected}` : undefined}
+            aria-activedescendant={
+              results[selected] ? `swiss-command-result-${selected}` : undefined
+            }
             autoComplete="off"
             spellCheck={false}
             placeholder="Search your browser…"
@@ -386,14 +600,23 @@ function CommandView({ onBack }: { onBack: () => void }) {
           ))}
           {!results.length ? (
             <li className="command-empty">
-              {query ? "No matching tabs, bookmarks, or history." : "Your browser activity will appear here."}
+              {query
+                ? "No matching tabs, bookmarks, or history."
+                : "Your browser activity will appear here."}
             </li>
           ) : null}
         </ul>
         <div className="command-hints" aria-hidden="true">
-          <span><kbd>↑</kbd><kbd>↓</kbd> Select</span>
-          <span><kbd>↵</kbd> Open</span>
-          <span><kbd>esc</kbd> Clear</span>
+          <span>
+            <kbd>↑</kbd>
+            <kbd>↓</kbd> Select
+          </span>
+          <span>
+            <kbd>↵</kbd> Open
+          </span>
+          <span>
+            <kbd>esc</kbd> Clear
+          </span>
         </div>
       </main>
     </>
@@ -409,11 +632,15 @@ function LensView({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void (async () => {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+        const [tab] = await chrome.tabs.query({
+          active: true,
+          currentWindow: true,
+        })
         let host = ""
         try {
           const parsed = new URL(tab?.url || "")
-          if (parsed.protocol === "http:" || parsed.protocol === "https:") host = parsed.hostname
+          if (parsed.protocol === "http:" || parsed.protocol === "https:")
+            host = parsed.hostname
         } catch {
           host = ""
         }
@@ -423,10 +650,17 @@ function LensView({ onBack }: { onBack: () => void }) {
           setStatus("Swiss Lens is unavailable on this page.")
           return
         }
-        const data = await getLocal<{ swissLensProfiles?: Record<string, LensSettings> }>("swissLensProfiles")
-        setSettings({ ...defaultLensSettings, ...(data.swissLensProfiles?.[host] || {}) })
+        const data = await getLocal<{
+          swissLensProfiles?: Record<string, LensSettings>
+        }>("swissLensProfiles")
+        setSettings({
+          ...defaultLensSettings,
+          ...(data.swissLensProfiles?.[host] || {}),
+        })
         setStatus(`Settings for ${host}`)
-      })().catch((error) => setStatus(error instanceof Error ? error.message : String(error)))
+      })().catch((error) =>
+        setStatus(error instanceof Error ? error.message : String(error))
+      )
     }, 0)
     return () => window.clearTimeout(timer)
   }, [])
@@ -441,14 +675,20 @@ function LensView({ onBack }: { onBack: () => void }) {
       reduceMotion: next.reduceMotion === true,
     }
     setSettings(safe)
-    const data = await getLocal<{ swissLensProfiles?: Record<string, LensSettings> }>("swissLensProfiles")
+    const data = await getLocal<{
+      swissLensProfiles?: Record<string, LensSettings>
+    }>("swissLensProfiles")
     await setLocal({
       swissLensProfiles: { ...(data.swissLensProfiles || {}), [siteKey]: safe },
     })
     if (tabId != null) {
-      await chrome.tabs.sendMessage(tabId, { type: "swissLensApply", settings: safe }).catch(() => undefined)
+      await chrome.tabs
+        .sendMessage(tabId, { type: "swissLensApply", settings: safe })
+        .catch(() => undefined)
     }
-    setStatus(safe.enabled ? `Applied to ${siteKey}` : `Lens is off for ${siteKey}`)
+    setStatus(
+      safe.enabled ? `Applied to ${siteKey}` : `Lens is off for ${siteKey}`
+    )
   }
 
   const disabled = !siteKey
@@ -470,13 +710,24 @@ function LensView({ onBack }: { onBack: () => void }) {
 
         <section aria-labelledby="lens-text-title" className="space-y-2">
           <div className="px-1">
-            <h2 id="lens-text-title" className="text-xs font-semibold">Text</h2>
-            <p className="mt-1 truncate text-[11px] text-muted-foreground">{siteKey || "Open a regular website to use Swiss Lens."}</p>
+            <h2 id="lens-text-title" className="text-xs font-semibold">
+              Text
+            </h2>
+            <p className="mt-1 truncate text-[11px] text-muted-foreground">
+              {siteKey || "Open a regular website to use Swiss Lens."}
+            </p>
           </div>
           <Card className="gap-3 p-4 py-4">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="lens-font-scale" className="text-xs">Text size</Label>
-              <output htmlFor="lens-font-scale" className="text-[11px] text-muted-foreground tabular-nums">{settings.fontScale}%</output>
+              <Label htmlFor="lens-font-scale" className="text-xs">
+                Text size
+              </Label>
+              <output
+                htmlFor="lens-font-scale"
+                className="text-[11px] text-muted-foreground tabular-nums"
+              >
+                {settings.fontScale}%
+              </output>
             </div>
             <input
               id="lens-font-scale"
@@ -487,27 +738,60 @@ function LensView({ onBack }: { onBack: () => void }) {
               step="5"
               value={settings.fontScale}
               disabled={disabled || !settings.enabled}
-              onChange={(event) => void save({ ...settings, fontScale: Number(event.target.value) })}
+              onChange={(event) =>
+                void save({
+                  ...settings,
+                  fontScale: Number(event.target.value),
+                })
+              }
             />
           </Card>
         </section>
 
         <section aria-labelledby="lens-display-title" className="space-y-2">
-          <h2 id="lens-display-title" className="px-1 text-xs font-semibold">Display</h2>
+          <h2 id="lens-display-title" className="px-1 text-xs font-semibold">
+            Display
+          </h2>
           <Card className="gap-0 p-3 py-1">
             <Row label="Clean page">
-              <Switch aria-label="Hide sidebars and common distractions" checked={settings.cleanPage} disabled={disabled || !settings.enabled} onCheckedChange={(cleanPage) => void save({ ...settings, cleanPage })} />
+              <Switch
+                aria-label="Hide sidebars and common distractions"
+                checked={settings.cleanPage}
+                disabled={disabled || !settings.enabled}
+                onCheckedChange={(cleanPage) =>
+                  void save({ ...settings, cleanPage })
+                }
+              />
             </Row>
             <Row label="High contrast">
-              <Switch aria-label="Use a high contrast reading theme" checked={settings.highContrast} disabled={disabled || !settings.enabled} onCheckedChange={(highContrast) => void save({ ...settings, highContrast })} />
+              <Switch
+                aria-label="Use a high contrast reading theme"
+                checked={settings.highContrast}
+                disabled={disabled || !settings.enabled}
+                onCheckedChange={(highContrast) =>
+                  void save({ ...settings, highContrast })
+                }
+              />
             </Row>
             <Row label="Reduce motion">
-              <Switch aria-label="Reduce animations and smooth scrolling" checked={settings.reduceMotion} disabled={disabled || !settings.enabled} onCheckedChange={(reduceMotion) => void save({ ...settings, reduceMotion })} />
+              <Switch
+                aria-label="Reduce animations and smooth scrolling"
+                checked={settings.reduceMotion}
+                disabled={disabled || !settings.enabled}
+                onCheckedChange={(reduceMotion) =>
+                  void save({ ...settings, reduceMotion })
+                }
+              />
             </Row>
           </Card>
         </section>
 
-        <Button variant="secondary" className="h-10 w-full rounded-xl active:scale-[0.96]" disabled={disabled} onClick={() => void save(defaultLensSettings)}>
+        <Button
+          variant="secondary"
+          className="h-10 w-full rounded-xl active:scale-[0.96]"
+          disabled={disabled}
+          onClick={() => void save(defaultLensSettings)}
+        >
           Reset this site
         </Button>
         <StatusLine>{status}</StatusLine>
@@ -576,7 +860,7 @@ function CaptureView({ onBack }: { onBack: () => void }) {
               <h2 className="text-sm font-semibold tracking-[-0.015em]">
                 Capture the full page
               </h2>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
+              <p className="mt-1 text-xs leading-relaxed text-pretty text-muted-foreground">
                 Save the current page as a stitched PNG or PDF.
               </p>
             </div>
@@ -604,12 +888,57 @@ function CaptureView({ onBack }: { onBack: () => void }) {
 }
 
 function TabsView({ onBack }: { onBack: () => void }) {
-  const [s, setS] = useState<Settings>(defaultSettings)
+  const [s, setS] = useState<Settings>({ ...defaultSettings, enabled: false })
+  const [settingsReady, setSettingsReady] = useState(false)
   const [status, setStatus] = useState("")
+  const [faviconStatus, setFaviconStatus] = useState("")
+  const [faviconBusy, setFaviconBusy] = useState(false)
+  const [faviconProgress, setFaviconProgress] =
+    useState<FaviconRefreshProgress | null>(null)
   const [restore, setRestore] = useState<{
     done: number
     total: number
   } | null>(null)
+
+  const applyFaviconProgress = useCallback(
+    (progress: FaviconRefreshProgress | null | undefined) => {
+      if (!progress) return
+      setFaviconProgress(progress)
+      if (progress.status === "running") {
+        setFaviconBusy(true)
+        setFaviconStatus("Finding website icons…")
+        return
+      }
+
+      setFaviconBusy(false)
+      if (progress.status === "error") {
+        setFaviconStatus(progress.error || "Website icon refresh failed.")
+        return
+      }
+
+      const parts: string[] = []
+      if (progress.refreshed) {
+        parts.push(
+          `Updated ${progress.refreshed} tab icon${progress.refreshed === 1 ? "" : "s"}.`
+        )
+      }
+      if (progress.failed) {
+        parts.push(`${progress.failed} could not be updated.`)
+      }
+      if (progress.remaining) {
+        parts.push(`Run again for ${progress.remaining} more.`)
+      }
+      if (progress.skippedActive) {
+        parts.push(
+          `${progress.skippedActive} active tab${progress.skippedActive === 1 ? " was" : "s were"} skipped.`
+        )
+      }
+      setFaviconStatus(
+        parts.join(" ") || "All suspended tabs already use website icons."
+      )
+    },
+    []
+  )
 
   const load = useCallback(async () => {
     const data = await getLocal<{
@@ -618,7 +947,7 @@ function TabsView({ onBack }: { onBack: () => void }) {
     const raw = data.settings || {}
     setS({
       ...defaultSettings,
-      enabled: raw.enabled !== false,
+      enabled: raw.enabled === true,
       timeoutMinutes: Number(raw.timeoutMinutes) || 5,
       mode: String(raw.mode || "placeholder"),
       checkPeriodMinutes: Number(raw.checkPeriodMinutes) || 1,
@@ -629,7 +958,10 @@ function TabsView({ onBack }: { onBack: () => void }) {
       skipGroupedInHibernate: raw.skipGroupedInHibernate === true,
       smartRulesEnabled: raw.smartRulesEnabled === true,
       smartDefaultMode: String(raw.smartDefaultMode || "discard"),
-      smartHeuristicsFallback: raw.smartHeuristicsFallback !== false,
+      smartUseHeuristicsFallback:
+        raw.smartUseHeuristicsFallback !== undefined
+          ? raw.smartUseHeuristicsFallback !== false
+          : raw.smartHeuristicsFallback !== false,
       smartPlaceholderDomains: linesToText(
         raw.smartPlaceholderDomains as string[] | string | undefined
       ),
@@ -637,6 +969,7 @@ function TabsView({ onBack }: { onBack: () => void }) {
         raw.smartDiscardDomains as string[] | string | undefined
       ),
     })
+    setSettingsReady(true)
   }, [])
 
   useEffect(() => {
@@ -657,6 +990,7 @@ function TabsView({ onBack }: { onBack: () => void }) {
   }
 
   const patch = (partial: Partial<Settings>) => {
+    if (!settingsReady) return
     void save({ ...s, ...partial })
   }
 
@@ -671,11 +1005,14 @@ function TabsView({ onBack }: { onBack: () => void }) {
         error?: string
         count?: number
         suspended?: number
+        capped?: boolean
       }>({
         type,
         ...extra,
       })
       if (r?.error) setStatus(r.error)
+      else if (typeof r?.suspended === "number" && r.capped)
+        setStatus(`Suspended ${r.suspended}. Run again to continue.`)
       else setStatus(okMsg)
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
@@ -698,6 +1035,17 @@ function TabsView({ onBack }: { onBack: () => void }) {
     return () => chrome.storage.onChanged.removeListener(onChange)
   }, [])
 
+  const refreshTabIcons = async () => {
+    setFaviconBusy(true)
+    setFaviconStatus("Finding website icons…")
+    try {
+      await refreshSuspendedFaviconsInPanel(applyFaviconProgress)
+    } catch (e) {
+      setFaviconStatus(e instanceof Error ? e.message : String(e))
+      setFaviconBusy(false)
+    }
+  }
+
   return (
     <>
       <PanelHeader title="Tab Hibernate" onBack={onBack} />
@@ -717,6 +1065,7 @@ function TabsView({ onBack }: { onBack: () => void }) {
                     id="hibernate-enabled"
                     aria-label="Enable automatic hibernation"
                     checked={s.enabled}
+                    disabled={!settingsReady}
                     onCheckedChange={(v) => patch({ enabled: v })}
                   />
                 </CardAction>
@@ -942,6 +1291,46 @@ function TabsView({ onBack }: { onBack: () => void }) {
             </section>
           ) : null}
 
+          <section aria-labelledby="tab-icons-title" className="space-y-2">
+            <div>
+              <h2 id="tab-icons-title" className="text-xs font-semibold">
+                Suspended tab icons
+              </h2>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                Replace the extension icon with each website&apos;s monochrome
+                favicon.
+              </p>
+            </div>
+            <Card size="sm" className="gap-3 p-3">
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                Keep this panel open. Suspended tabs update one at a time, then
+                return to sleep.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full active:scale-[0.96]"
+                disabled={faviconBusy}
+                onClick={() => void refreshTabIcons()}
+              >
+                <Refresh aria-hidden="true" />
+                {faviconBusy ? "Finding website icons…" : "Refresh tab icons"}
+              </Button>
+              {faviconProgress && faviconProgress.total > 0 ? (
+                <div className="space-y-1.5">
+                  <Progress
+                    aria-label="Website icon refresh progress"
+                    value={(faviconProgress.done / faviconProgress.total) * 100}
+                  />
+                  <p className="text-[11px] text-muted-foreground tabular-nums">
+                    {faviconProgress.done} of {faviconProgress.total} tabs
+                  </p>
+                </div>
+              ) : null}
+              <StatusLine>{faviconStatus}</StatusLine>
+            </Card>
+          </section>
+
           <section aria-labelledby="tab-actions-title" className="space-y-2">
             <div>
               <h2 id="tab-actions-title" className="text-xs font-semibold">
@@ -1057,9 +1446,9 @@ function TabsView({ onBack }: { onBack: () => void }) {
             <div className="grid gap-2 px-3 pb-3">
               <Button
                 variant="outline"
-                onClick={() => void run("backupNow", "Tabs backed up")}
+                onClick={() => void run("backupNow", "Backup updated")}
               >
-                Back up tabs
+                Update backup
               </Button>
               <Button
                 variant="outline"
@@ -1068,14 +1457,6 @@ function TabsView({ onBack }: { onBack: () => void }) {
                 }
               >
                 Recover lost tabs
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() =>
-                  void run("emergencyBackupNow", "Emergency backup created")
-                }
-              >
-                Create emergency backup
               </Button>
             </div>
           </details>
@@ -1133,7 +1514,7 @@ function MemoryView({ onBack }: { onBack: () => void }) {
               <h2 className="text-sm font-semibold tracking-[-0.015em]">
                 Free memory now
               </h2>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
+              <p className="mt-1 text-xs leading-relaxed text-pretty text-muted-foreground">
                 Discard inactive background tabs without closing them.
               </p>
             </div>
@@ -1145,6 +1526,8 @@ function MemoryView({ onBack }: { onBack: () => void }) {
               try {
                 const r = await sendMessage<{
                   discarded?: number
+                  remaining?: number
+                  capped?: boolean
                   error?: string
                 }>({
                   type: "discardBackgroundTabs",
@@ -1152,7 +1535,9 @@ function MemoryView({ onBack }: { onBack: () => void }) {
                 setStatus(
                   r?.error ||
                     (typeof r?.discarded === "number"
-                      ? `Discarded ${r.discarded} tabs`
+                      ? r.capped
+                        ? `Discarded ${r.discarded}. ${r.remaining || 0} left, run again.`
+                        : `Discarded ${r.discarded} tabs`
                       : "Done")
                 )
               } catch (e) {
@@ -1165,8 +1550,14 @@ function MemoryView({ onBack }: { onBack: () => void }) {
           <StatusLine>{status}</StatusLine>
         </Card>
 
-        <section aria-labelledby="memory-protection-title" className="space-y-2">
-          <h2 id="memory-protection-title" className="px-1 text-xs font-semibold">
+        <section
+          aria-labelledby="memory-protection-title"
+          className="space-y-2"
+        >
+          <h2
+            id="memory-protection-title"
+            className="px-1 text-xs font-semibold"
+          >
             Protect tabs
           </h2>
           <Card className="gap-0 p-3 py-1">
@@ -1201,7 +1592,10 @@ function MemoryView({ onBack }: { onBack: () => void }) {
           </Card>
         </section>
 
-        <section aria-labelledby="memory-exclusions-title" className="space-y-2">
+        <section
+          aria-labelledby="memory-exclusions-title"
+          className="space-y-2"
+        >
           <div className="px-1">
             <h2 id="memory-exclusions-title" className="text-xs font-semibold">
               Excluded domains
@@ -1403,7 +1797,9 @@ function BlockerView({ onBack }: { onBack: () => void }) {
                     variant="ghost"
                     aria-label={`Remove ${d} from always allowed sites`}
                     onClick={() =>
-                      void setLocal({ whitelist: whitelist.filter((x) => x !== d) })
+                      void setLocal({
+                        whitelist: whitelist.filter((x) => x !== d),
+                      })
                     }
                   >
                     Remove
@@ -1425,9 +1821,11 @@ function BlockerView({ onBack }: { onBack: () => void }) {
             className="h-10 rounded-xl"
             onClick={async () => {
               try {
-                const r = await sendMessage<{ count?: number; error?: string }>({
-                  type: "saveBlockedTabsNow",
-                })
+                const r = await sendMessage<{ count?: number; error?: string }>(
+                  {
+                    type: "saveBlockedTabsNow",
+                  }
+                )
                 setStatus(r?.error || `Saved ${r?.count ?? 0} tabs`)
               } catch (e) {
                 setStatus(e instanceof Error ? e.message : String(e))
@@ -1542,7 +1940,7 @@ function ClearView({ onBack }: { onBack: () => void }) {
               <h2 className="text-sm font-semibold tracking-[-0.015em]">
                 Clear data for this site
               </h2>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
+              <p className="mt-1 text-xs leading-relaxed text-pretty text-muted-foreground">
                 Choose what to remove from the active website.
               </p>
             </div>
@@ -1568,7 +1966,10 @@ function ClearView({ onBack }: { onBack: () => void }) {
               </label>
             ))}
           </div>
-          <Button className="h-10 w-full rounded-xl" onClick={() => void clear()}>
+          <Button
+            className="h-10 w-full rounded-xl"
+            onClick={() => void clear()}
+          >
             Clear selected data
           </Button>
           <StatusLine>{status}</StatusLine>

@@ -17,7 +17,7 @@ Less clutter. More focus.
 
 **Main copy:**
 
-Your browser shouldn’t feel like a second job. **Swiss Extensions** brings practical tools into **one minimal side panel** — so you move faster, use less RAM, and stay on task.
+Your browser shouldn’t feel like a second job. **Rigi Extensions** brings practical tools into **one minimal side panel** — so you move faster, use less RAM, and stay on task.
 
 **What’s inside**
 

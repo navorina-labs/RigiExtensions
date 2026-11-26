@@ -7,6 +7,14 @@
 
   try {
     const params = new URLSearchParams(window.location.search)
+    if (params.get("faviconRefresh") === "1") {
+      // The side panel only needs the icon. Keep the full suspended React UI
+      // out of memory, then restore the canonical URL before the tab sleeps.
+      window.__suspendedFaviconOnly = true
+      const cleanUrl = new URL(window.location.href)
+      cleanUrl.searchParams.delete("faviconRefresh")
+      window.history.replaceState(null, "", cleanUrl.toString())
+    }
     const pageUrl = params.get("u") || params.get("o") || ""
     if (!/^https?:\/\//i.test(pageUrl)) {
       link.type = "image/svg+xml"
@@ -36,6 +44,11 @@
         context.filter = "grayscale(1)"
         context.drawImage(image, 0, 0, 32, 32)
         link.href = canvas.toDataURL("image/png")
+        image.onload = null
+        image.onerror = null
+        image.src = ""
+        canvas.width = 0
+        canvas.height = 0
       } catch {
         link.href = faviconUrl.toString()
       }

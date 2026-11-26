@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 128" role="img" aria-label="Rigi Extensions">
+  <rect x="16" y="16" width="96" height="96" rx="24" fill="#D52B1E"/>
+  <path d="M27 91 49 73l17-32 12 23 23 27H27Z" fill="#FFF"/>
+  <path d="m49 73 17-32 12 23 9 10-10-6-11-16-10 24Z" fill="#D52B1E"/>
+  <text x="140" y="78" fill="#202020" font-family="Inter, Arial, sans-serif" font-size="40" font-weight="750" letter-spacing="-1.4">Rigi Extensions</text>
+</svg>

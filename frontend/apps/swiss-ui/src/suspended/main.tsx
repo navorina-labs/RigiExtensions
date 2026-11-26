@@ -1,21 +1,22 @@
-import { StrictMode } from "react"
-import { createRoot } from "react-dom/client"
-import { TooltipProvider } from "@workspace/ui/components/tooltip"
-import "@workspace/ui/globals.css"
-import { SuspendedApp } from "./App"
-import {
-  applyDocumentTheme,
-  getCachedUiTheme,
-  installDevChromeMock,
-} from "@/lib/chrome"
+declare global {
+  interface Window {
+    __suspendedFaviconOnly?: boolean
+  }
+}
 
-installDevChromeMock()
-applyDocumentTheme(getCachedUiTheme())
+// Favicon refreshes use a tiny document and never import React, the component
+// library, screenshots, theme state, or the full suspended-page stylesheet.
+async function startSuspendedPage() {
+  try {
+    const { mountSuspendedApp } = await import("./mount")
+    mountSuspendedApp()
+  } catch (error) {
+    console.error("[TabHibernate] suspended page failed to start", error)
+  }
+}
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <TooltipProvider>
-      <SuspendedApp />
-    </TooltipProvider>
-  </StrictMode>
-)
+if (!window.__suspendedFaviconOnly) {
+  void startSuspendedPage()
+}
+
+export {}

@@ -10,13 +10,22 @@ const ALARM_CHECK_PERIOD_MINUTES = 1;
 const INACTIVITY_MINUTES = 5;
 const MAX_INACTIVITY_MINUTES = 24 * 60;
 const CHECK_PERIOD_OPTIONS = [1, 2, 5];
+const FAVICON_REFRESH_BATCH_MAX = 50;
+const FAVICON_REFRESH_TIMEOUT_MS = 6000;
+const FAVICON_REFRESH_ALARM = 'tabHibernateFaviconRefresh';
+const FAVICON_REFRESH_JOB_KEY = 'faviconRefreshJob';
+const FAVICON_REFRESH_PROGRESS_KEY = 'faviconRefreshProgress';
 /** Keep backup-by-date keys only for the last N days; remove older ones. */
 const BACKUP_RETENTION_DAYS = 30;
 const BACKUP_KEY_CATALOG = 'backupKeyCatalog';
 const DAILY_SESSION_SNAPSHOT_PREFIX = 'dailySessionSnapshot_';
 const DAILY_SESSION_SNAPSHOT_CATALOG = 'dailySessionSnapshotCatalog';
 const DAILY_SESSION_SNAPSHOT_MAX_ENTRIES = 5000;
+/** One session backup. Later saves replace it instead of appending another copy. */
+const ROLLING_SESSION_BACKUP_KEY = 'rollingSessionBackup';
+const ROLLING_BACKUP_FOLDER_TITLE = 'Current';
 const LIGHT_MAINTENANCE_INTERVAL_MS = 15 * 60 * 1000;
+const LAST_LIGHT_MAINTENANCE_AT = 'lastLightMaintenanceAt';
 const PLACEHOLDER_MAINTENANCE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const LAST_PLACEHOLDER_MAINTENANCE_AT = 'lastPlaceholderMaintenanceAt';
 const PLACEHOLDER_MAINTENANCE_CURSOR = 'placeholderMaintenanceCursor';
@@ -32,6 +41,9 @@ const BLOCKER_PRESERVE_ALARM = 'swissBlockerPreserveTabs';
 const BLOCKER_PRESERVE_PERIOD_MINUTES = 2;
 const BLOCKER_TAB_URL_KEY = 'blockerTabUrlByTabId';
 const SITE_BLOCKER_RULE_SIGNATURE_KEY = 'siteBlockerRuleSignature';
+const BLOCKER_OPEN_TAB_ENFORCE_AT_KEY = 'lastBlockerOpenTabEnforceAt';
+const CAPTURE_STATE_KEY = 'pageCaptureState';
+const CAPTURE_STATE_STALE_MS = 3 * 60 * 1000;
 const REMOVED_TAB_CLEANUP_DELAY_MS = 150;
 const BADGE_UPDATE_DELAY_MS = 200;
 /** Serialize Site Blocker applyRules; parallel calls after SW wake broke DNR on recent Chrome. */
@@ -54,9 +66,7 @@ let lastFocusedWindowId = null;
 let alarmCheckPromise = null;
 let placeholderMaintenanceScheduled = false;
 let siteBlockerNavEnforceChain = Promise.resolve();
-let lastBlockerOpenTabEnforceAt = 0;
 let captureInProgress = false;
-let lastLightMaintenanceAt = 0;
 let runtimePlaceholderRepairPromise = null;
 let dailySessionSnapshotPromise = null;
 /** Ignore Chrome's transient groupId=-1 while a tab navigates to suspended.html. */
@@ -66,6 +76,10 @@ const lastHttpUrlByTabId = new Map();
 /** Prevent onUpdated and webNavigation from converting the same blocked tab twice. */
 const blockerPlaceholderConversions = new Set();
 const BLOCKER_OPEN_TAB_ENFORCE_MS = 5 * 60 * 1000;
+/** Stop a blocked-tab reload from immediately reloading the same tab again. */
+const blockerReloadCooldownUntil = new Map();
+const BLOCKER_RELOAD_COOLDOWN_MS = 60 * 1000;
+const BLOCKER_RELOAD_MAX_PER_RUN = 8;
 
 async function getStoredState() {
   const raw = await chrome.storage.local.get(['lastActivityByTab', 'settings', 'suspendedToday', 'suspendedTodayDate']);
@@ -321,9 +335,11 @@ async function discardInactivePlaceholder(tab) {
 
 function isResolvedPlaceholderFavicon(favIconUrl) {
   const url = String(favIconUrl || '');
-  if (!url) return false;
-  return url.startsWith('data:image/')
-    || url.endsWith('/suspended-fallback.svg');
+  // Only a self-contained canvas result is safe to keep after discard.
+  // Treating the temporary SVG as ready unloads the page before the site's
+  // monochrome favicon is written, after which Chrome shows the red extension
+  // icon for every suspended tab.
+  return url.startsWith('data:image/');
 }
 
 function waitForPlaceholderFavicon(tabId, timeoutMs = 8000) {
@@ -346,6 +362,151 @@ function waitForPlaceholderFavicon(tabId, timeoutMs = 8000) {
       if (isResolvedPlaceholderFavicon(current?.favIconUrl)) finish(true);
     }).catch(() => finish(false));
   });
+}
+
+/**
+ * Schedule one durable favicon refresh step. The alarm survives service-worker
+ * shutdowns, unlike a long runtime message or an in-memory timer.
+ */
+async function scheduleSuspendedFaviconRefresh(delayMs = 100) {
+  await chrome.alarms.create(FAVICON_REFRESH_ALARM, {
+    when: Date.now() + Math.max(0, delayMs),
+  });
+}
+
+async function startSuspendedFaviconRefresh() {
+  const stored = await chrome.storage.local.get(FAVICON_REFRESH_JOB_KEY);
+  const current = stored[FAVICON_REFRESH_JOB_KEY];
+  if (current?.status === 'running' && Array.isArray(current.tabIds)) {
+    await scheduleSuspendedFaviconRefresh();
+    return {
+      started: true,
+      running: true,
+      alreadyRunning: true,
+      done: Number(current.index) || 0,
+      total: current.tabIds.length,
+    };
+  }
+
+  const tabs = await chrome.tabs.query({});
+  const placeholders = tabs.filter((tab) => (
+    tab?.id && (isPlaceholderTabUrl(tab.url) || isSuspendedPlaceholderUrl(tab.url))
+  ));
+  const unresolved = placeholders.filter((tab) => !isResolvedPlaceholderFavicon(tab.favIconUrl));
+  const candidates = unresolved.filter((tab) => !tab.active);
+  const skippedActive = unresolved.length - candidates.length;
+  const batch = candidates.slice(0, FAVICON_REFRESH_BATCH_MAX);
+  const job = {
+    status: 'running',
+    tabIds: batch.map((tab) => tab.id),
+    index: 0,
+    refreshed: 0,
+    failed: 0,
+    remaining: Math.max(0, candidates.length - batch.length),
+    skippedActive,
+    startedAt: Date.now(),
+  };
+  const progress = {
+    status: batch.length ? 'running' : 'complete',
+    done: 0,
+    total: batch.length,
+    refreshed: 0,
+    failed: 0,
+    remaining: job.remaining,
+    skippedActive,
+  };
+
+  if (!batch.length) {
+    await chrome.storage.local.remove(FAVICON_REFRESH_JOB_KEY);
+    await chrome.storage.local.set({ [FAVICON_REFRESH_PROGRESS_KEY]: progress });
+    return { started: false, ...progress };
+  }
+
+  await chrome.storage.local.set({
+    [FAVICON_REFRESH_JOB_KEY]: job,
+    [FAVICON_REFRESH_PROGRESS_KEY]: progress,
+  });
+  await scheduleSuspendedFaviconRefresh();
+  return { started: true, running: true, done: 0, total: batch.length };
+}
+
+/** Load one suspended placeholder, resolve its favicon, then put it to sleep. */
+async function processNextSuspendedFaviconRefresh() {
+  const stored = await chrome.storage.local.get(FAVICON_REFRESH_JOB_KEY);
+  const job = stored[FAVICON_REFRESH_JOB_KEY];
+  if (job?.status !== 'running' || !Array.isArray(job.tabIds)) return;
+
+  const index = Number(job.index) || 0;
+  if (index >= job.tabIds.length) {
+    await chrome.storage.local.remove(FAVICON_REFRESH_JOB_KEY);
+    return;
+  }
+
+  // Leave a watchdog alarm behind before doing renderer work. If Chrome stops
+  // the worker mid-step, the same persisted cursor is retried on the next wake.
+  await scheduleSuspendedFaviconRefresh(FAVICON_REFRESH_TIMEOUT_MS + 5000);
+  const tabId = job.tabIds[index];
+  let refreshed = Number(job.refreshed) || 0;
+  let failed = Number(job.failed) || 0;
+  let skippedActive = Number(job.skippedActive) || 0;
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.active) {
+      skippedActive += 1;
+    } else if (!isPlaceholderTabUrl(tab.url) && !isSuspendedPlaceholderUrl(tab.url)) {
+      failed += 1;
+    } else if (isResolvedPlaceholderFavicon(tab.favIconUrl)) {
+      refreshed += 1;
+    } else {
+      const faviconReady = waitForPlaceholderFavicon(tabId, FAVICON_REFRESH_TIMEOUT_MS);
+      await chrome.tabs.reload(tabId);
+      if (await faviconReady) refreshed += 1;
+      else failed += 1;
+    }
+  } catch (e) {
+    failed += 1;
+    console.warn('[TabHibernate] favicon refresh failed', tabId, e);
+  } finally {
+    try {
+      const fresh = await chrome.tabs.get(tabId);
+      if (!fresh.active && !fresh.discarded
+        && (isPlaceholderTabUrl(fresh.url) || isSuspendedPlaceholderUrl(fresh.url))) {
+        await chrome.tabs.discard(fresh.id);
+      }
+    } catch (_) {}
+  }
+
+  const nextIndex = index + 1;
+  const complete = nextIndex >= job.tabIds.length;
+  const progress = {
+    status: complete ? 'complete' : 'running',
+    done: nextIndex,
+    total: job.tabIds.length,
+    refreshed,
+    failed,
+    remaining: Number(job.remaining) || 0,
+    skippedActive,
+  };
+
+  if (complete) {
+    await chrome.storage.local.set({ [FAVICON_REFRESH_PROGRESS_KEY]: progress });
+    await chrome.storage.local.remove(FAVICON_REFRESH_JOB_KEY);
+    await chrome.alarms.clear(FAVICON_REFRESH_ALARM);
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [FAVICON_REFRESH_JOB_KEY]: {
+      ...job,
+      index: nextIndex,
+      refreshed,
+      failed,
+      skippedActive,
+    },
+    [FAVICON_REFRESH_PROGRESS_KEY]: progress,
+  });
+  await scheduleSuspendedFaviconRefresh();
 }
 
 async function openPlaceholderTabForItem(item, windowId = null) {
@@ -372,7 +533,20 @@ async function openPlaceholderTabForItem(item, windowId = null) {
   return tab;
 }
 
-/** Re-group tabs by saved groupKey. forceRegroup=true only for History/open restore; maintenance must not override user edits. */
+/** Collapse a group without ever writing collapsed:false, which pops groups open. */
+async function collapseTabGroup(groupId) {
+  if (groupId == null || groupId === -1) return;
+  try {
+    await chrome.tabGroups.update(groupId, { collapsed: true });
+  } catch (_) {}
+}
+
+/**
+ * Re-group tabs by saved groupKey.
+ * forceRegroup is for an explicit restore. Maintenance must not pull tabs back
+ * into a group. Collapsed groups are only collapsed again, never expanded:
+ * Chrome opens a group when a tab inside it navigates or is regrouped.
+ */
 async function applySavedTabGroups(pairs, { forceRegroup = false } = {}) {
   const byKey = new Map();
   for (const { tabId, item } of pairs) {
@@ -389,30 +563,44 @@ async function applySavedTabGroups(pairs, { forceRegroup = false } = {}) {
     const tabInfos = (await Promise.all(ids.map((id) => chrome.tabs.get(id).catch(() => null)))).filter(Boolean);
     if (!tabInfos.length) continue;
 
-    const update = {};
-    if (meta.groupTitle) update.title = meta.groupTitle;
-    if (meta.groupColor) update.color = meta.groupColor;
-    if (typeof meta.groupCollapsed === 'boolean') update.collapsed = meta.groupCollapsed;
-
+    let targetGroupId = null;
     const groupedIds = tabInfos
       .map((t) => t.groupId)
       .filter((g) => g != null && g !== -1);
     const uniqueGroupIds = new Set(groupedIds);
-
-    if (uniqueGroupIds.size === 1 && tabInfos.every((t) => t.groupId === groupedIds[0])) {
-      if (forceRegroup && Object.keys(update).length) {
-        try {
-          await chrome.tabGroups.update(groupedIds[0], update);
-        } catch (_) {}
-      }
-      continue;
+    if (uniqueGroupIds.size === 1) targetGroupId = groupedIds[0];
+    if (targetGroupId == null && meta.groupId != null && meta.groupId !== -1) {
+      try {
+        await chrome.tabGroups.get(meta.groupId);
+        targetGroupId = meta.groupId;
+      } catch (_) {}
     }
 
+    const shouldCollapse = meta.groupCollapsed === true;
+    const outsiders = targetGroupId == null
+      ? tabInfos
+      : tabInfos.filter((tab) => tab.groupId !== targetGroupId);
+    if (!outsiders.length) {
+      if (shouldCollapse) await collapseTabGroup(targetGroupId);
+      continue;
+    }
     if (!forceRegroup) continue;
 
     try {
-      const groupId = await chrome.tabs.group({ tabIds: tabInfos.map((t) => t.id) });
-      if (Object.keys(update).length) await chrome.tabGroups.update(groupId, update);
+      let groupId = targetGroupId;
+      if (groupId != null) {
+        await chrome.tabs.group({
+          tabIds: outsiders.map((tab) => tab.id),
+          groupId,
+        });
+      } else {
+        groupId = await chrome.tabs.group({ tabIds: tabInfos.map((tab) => tab.id) });
+        const update = {};
+        if (meta.groupTitle) update.title = meta.groupTitle;
+        if (meta.groupColor) update.color = meta.groupColor;
+        if (Object.keys(update).length) await chrome.tabGroups.update(groupId, update);
+      }
+      if (shouldCollapse) await collapseTabGroup(groupId);
     } catch (e) {
       console.warn('[TabHibernate] applySavedTabGroups failed', e);
     }
@@ -456,13 +644,15 @@ async function getSettings() {
   const smartPlaceholderDomains = parseDomainList(s.smartPlaceholderDomains);
   const smartDiscardDomains = parseDomainList(s.smartDiscardDomains);
   return {
-    enabled: s.enabled !== false,
+    enabled: s.enabled === true,
     timeoutMinutes: parsedTimeout,
     checkPeriodMinutes: parsedPeriod,
     excludedDomains,
     smartRulesEnabled: s.smartRulesEnabled === true,
     smartDefaultMode: s.smartDefaultMode === 'placeholder' ? 'placeholder' : 'discard',
-    smartUseHeuristicsFallback: s.smartUseHeuristicsFallback !== false,
+    smartUseHeuristicsFallback: s.smartUseHeuristicsFallback !== undefined
+      ? s.smartUseHeuristicsFallback !== false
+      : s.smartHeuristicsFallback !== false,
     smartPlaceholderDomains,
     smartDiscardDomains,
     /** Default placeholder so new installs get suspended.html, not silent chrome.discard (UI also defaults to Placeholder). */
@@ -799,24 +989,17 @@ async function getSuspendedTodayCount() {
   return suspendedTodayDate === today ? suspendedToday : 0;
 }
 
-/** Remove from storage backup_YYYY-MM-DD keys older than BACKUP_RETENTION_DAYS. */
+/** Remove backup_YYYY-MM-DD keys. The rolling snapshot replaces that pile. */
 async function pruneOldBackups() {
   try {
     const { [BACKUP_KEY_CATALOG]: catalog = [] } = await chrome.storage.local.get(BACKUP_KEY_CATALOG);
-    const now = new Date();
-    const cutoff = new Date(now);
-    cutoff.setDate(cutoff.getDate() - BACKUP_RETENTION_DAYS);
-    const cutoffStr = cutoff.toISOString().slice(0, 10);
-    const keep = [];
-    const remove = [];
-    for (const key of Array.isArray(catalog) ? catalog : []) {
-      const dateStr = key.slice(7);
-      if (dateStr.length === 10 && dateStr < cutoffStr) {
-        remove.push(key);
-      } else keep.push(key);
-    }
+    const remove = (Array.isArray(catalog) ? catalog : []).filter((key) => (
+      typeof key === 'string' && key.startsWith('backup_')
+    ));
     if (remove.length) await chrome.storage.local.remove(remove);
-    if (keep.length !== catalog.length) await chrome.storage.local.set({ [BACKUP_KEY_CATALOG]: keep });
+    if (remove.length || (Array.isArray(catalog) && catalog.length !== 0)) {
+      await chrome.storage.local.set({ [BACKUP_KEY_CATALOG]: [] });
+    }
   } catch (e) {
     console.warn('[TabHibernate] pruneOldBackups failed', e);
   }
@@ -1033,6 +1216,7 @@ async function suspendPlaceholder(tabId, url, title, favIconUrl, meta = {}) {
   });
   if (!skipBookmark) {
     try {
+      await removeSuspendedBookmark(safeUrl);
       const folderId = await getOrCreateSuspendedRecoveryFolder();
       await chrome.bookmarks.create({
         parentId: folderId,
@@ -1044,9 +1228,21 @@ async function suspendPlaceholder(tabId, url, title, favIconUrl, meta = {}) {
     }
   }
   const suspendedUrl = buildSuspendedPlaceholderUrl(tabId, { url: safeUrl });
+  let collapseGroupId = storedPayload.groupId != null && storedPayload.groupId !== -1
+    ? storedPayload.groupId
+    : null;
+  let collapseAfterSuspend = storedPayload.groupCollapsed === true;
+  if (isTabInGroup(sourceTab)) {
+    collapseGroupId = sourceTab.groupId;
+    try {
+      const liveGroup = await chrome.tabGroups.get(sourceTab.groupId);
+      if (liveGroup.collapsed === true) collapseAfterSuspend = true;
+    } catch (_) {}
+  }
+  if (collapseAfterSuspend) storedPayload.groupCollapsed = true;
   try {
-    placeholderGroupTransitionUntil.set(tabId, Date.now() + 5000);
-    setTimeout(() => placeholderGroupTransitionUntil.delete(tabId), 6000);
+    placeholderGroupTransitionUntil.set(tabId, Date.now() + 8000);
+    setTimeout(() => placeholderGroupTransitionUntil.delete(tabId), 9000);
     await chrome.tabs.update(tabId, { url: suspendedUrl });
     if (meta.groupId != null && meta.groupId !== -1) {
       try {
@@ -1060,6 +1256,12 @@ async function suspendPlaceholder(tabId, url, title, favIconUrl, meta = {}) {
         [{ tabId, item: storedPayload }],
         { forceRegroup: true },
       );
+    }
+    // Navigation finishes after tabs.update resolves and Chrome expands the
+    // group again. Collapse once now and once more when the placeholder loads.
+    if (collapseAfterSuspend && collapseGroupId != null) {
+      await collapseTabGroup(collapseGroupId);
+      waitForTabComplete(tabId, 5000).then(() => collapseTabGroup(collapseGroupId));
     }
     await incrementSuspendedToday();
     if (meta.deferBadge !== true) await updateBadge();
@@ -1132,9 +1334,8 @@ async function removeSuspendedBookmark(url) {
   }
 }
 
-/** Create or get bookmarks folder "Tab Backup / YYYY-MM-DD" (parent "Tab Backup", child is date). */
+/** One bookmark folder, "Tab Backup / Current", replaced on the next save. */
 async function getOrCreateBackupFolder() {
-  const dateStr = new Date().toISOString().slice(0, 10);
   const tree = await chrome.bookmarks.getTree();
   const root = tree[0];
 
@@ -1145,52 +1346,54 @@ async function getOrCreateBackupFolder() {
     const created = await chrome.bookmarks.create({ parentId: writableParent.id, title: 'Tab Backup' });
     tabBackupRoot = { id: created.id, children: [] };
   }
-  const dateFolder = findBookmarkFolder([tabBackupRoot], dateStr) || (tabBackupRoot.children && tabBackupRoot.children.find((c) => c.title === dateStr));
-  if (dateFolder && dateFolder.id) return dateFolder.id;
-  const created = await chrome.bookmarks.create({ parentId: tabBackupRoot.id, title: dateStr });
+  const currentFolder = findBookmarkFolder([tabBackupRoot], ROLLING_BACKUP_FOLDER_TITLE)
+    || (tabBackupRoot.children && tabBackupRoot.children.find((child) => child.title === ROLLING_BACKUP_FOLDER_TITLE));
+  if (currentFolder?.id) return currentFolder.id;
+  const created = await chrome.bookmarks.create({
+    parentId: tabBackupRoot.id,
+    title: ROLLING_BACKUP_FOLDER_TITLE,
+  });
   return created.id;
 }
 
-/** Backup: bookmarks + JSON in storage; skip duplicate URLs in one batch. */
-async function runBackup(source = 'manual') {
-  const tabs = await getEligibleTabsForBackup();
-  const seen = new Set();
-  const unique = tabs.filter((t) => {
-    const key = normalizeUrlKey(t.url);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  if (unique.length === 0) return { count: 0, folderId: null, folderPath: null };
-
-  const dateStr = new Date().toISOString().slice(0, 10);
-  const folderId = await getOrCreateBackupFolder();
-  const folderPath = `Tab Backup / ${dateStr}`;
-  const batchId = Date.now();
-  const groupMeta = await buildGroupMetaMapForTabs(unique, batchId);
-
-  for (const t of unique) {
+/** Replace bookmarks in one folder. Old dated folders under Tab Backup are left untouched. */
+async function replaceFolderBookmarks(folderId, entries) {
+  const children = await chrome.bookmarks.getChildren(folderId);
+  for (const child of children) {
+    if (!child.url) continue;
     try {
-      await chrome.bookmarks.create({ parentId: folderId, title: (t.title || t.url).slice(0, 255), url: t.url });
+      await chrome.bookmarks.remove(child.id);
     } catch (e) {
-      console.warn('[TabHibernate] bookmark create failed', t.url, e);
+      console.warn('[TabHibernate] bookmark remove failed', child.id, e);
     }
   }
-
-  const backupKey = `backup_${dateStr}`;
-  const existing = await chrome.storage.local.get(backupKey);
-  const list = existing[backupKey] || [];
-  const existingUrls = new Set(list.map((x) => normalizeUrlKey(x.url)));
-  for (const t of unique) {
-    const key = normalizeUrlKey(t.url);
-    if (!key || existingUrls.has(key)) continue;
-    let entry = { url: t.url, title: t.title || t.url, ts: Date.now() };
-    entry = copyGroupMetaToEntry(entry, groupMeta.get(t.id));
-    list.push(entry);
-    existingUrls.add(key);
+  const seen = new Set();
+  for (const entry of entries) {
+    const key = normalizeUrlKey(entry.url);
+    if (!key || seen.has(key) || !hasRestorableUrl(entry.url)) continue;
+    seen.add(key);
+    try {
+      await chrome.bookmarks.create({
+        parentId: folderId,
+        title: (entry.title || entry.url).slice(0, 255),
+        url: entry.url,
+      });
+    } catch (e) {
+      console.warn('[TabHibernate] bookmark create failed', entry.url, e);
+    }
   }
-  await persistBoundedList(backupKey, list, BACKUP_ENTRIES_MAX);
-  return { count: unique.length, folderId, folderPath };
+  return seen.size;
+}
+
+/** Backup: one rolling snapshot plus the same "Tab Backup / Current" folder. */
+async function runBackup(source = 'manual') {
+  const snapshot = await captureDailySessionSnapshot({ force: true, reason: source });
+  const items = Array.isArray(snapshot.items) ? snapshot.items : [];
+  if (!items.length) return { count: 0, folderId: null, folderPath: null };
+
+  const folderId = await getOrCreateBackupFolder();
+  const count = await replaceFolderBookmarks(folderId, items);
+  return { count, folderId, folderPath: 'Tab Backup / Current' };
 }
 
 /** Remove closed tab ids from lastActivityByTab to avoid bloating storage. */
@@ -1249,39 +1452,38 @@ function normalizeDailySnapshotCatalog(value) {
     .filter((entry) => entry?.key?.startsWith(DAILY_SESSION_SNAPSHOT_PREFIX));
 }
 
-/** Keep exactly the newest 30 daily recovery points and remove their storage keys. */
+/** Drop legacy per-day snapshots. The rolling backup is the only session copy. */
 async function pruneDailySessionSnapshots() {
   try {
     const stored = await chrome.storage.local.get(DAILY_SESSION_SNAPSHOT_CATALOG);
     const catalog = normalizeDailySnapshotCatalog(stored[DAILY_SESSION_SNAPSHOT_CATALOG]);
-    const byKey = new Map(catalog.map((entry) => [entry.key, entry]));
-    const sorted = [...byKey.values()].sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
-    const keep = sorted.slice(-BACKUP_RETENTION_DAYS);
-    const keepKeys = new Set(keep.map((entry) => entry.key));
-    const remove = sorted.filter((entry) => !keepKeys.has(entry.key)).map((entry) => entry.key);
+    const remove = [...new Set(catalog.map((entry) => entry.key))];
     if (remove.length) await chrome.storage.local.remove(remove);
-    if (remove.length || keep.length !== catalog.length) {
-      await chrome.storage.local.set({ [DAILY_SESSION_SNAPSHOT_CATALOG]: keep });
-    }
-    return keep;
+    if (catalog.length) await chrome.storage.local.set({ [DAILY_SESSION_SNAPSHOT_CATALOG]: [] });
+    return [];
   } catch (e) {
     console.warn('[TabHibernate] pruneDailySessionSnapshots failed', e);
     return [];
   }
 }
 
-/** One compact full-session snapshot per local calendar day, including Chrome group metadata. */
+function sessionBackupFingerprint(items) {
+  return (items || []).map((entry) => [
+    normalizeUrlKey(entry?.url) || '',
+    entry?.groupKey || '',
+    entry?.tabIndex ?? '',
+    entry?.windowOrder ?? '',
+  ].join('|')).join('\n');
+}
+
+/** Replace the single session backup, including Chrome group metadata. */
 async function captureDailySessionSnapshot({ force = false, reason = 'daily' } = {}) {
   if (dailySessionSnapshotPromise) return dailySessionSnapshotPromise;
   dailySessionSnapshotPromise = (async () => {
     const date = localDateStamp();
-    const storageKey = `${DAILY_SESSION_SNAPSHOT_PREFIX}${date}`;
-    const existing = await chrome.storage.local.get([storageKey, DAILY_SESSION_SNAPSHOT_CATALOG]);
-    const catalog = normalizeDailySnapshotCatalog(existing[DAILY_SESSION_SNAPSHOT_CATALOG]);
-    if (!force && Array.isArray(existing[storageKey]) && existing[storageKey].length) {
-      const meta = catalog.find((entry) => entry.key === storageKey);
-      return { created: false, key: storageKey, count: existing[storageKey].length, ...meta };
-    }
+    const existingWrap = await chrome.storage.local.get(ROLLING_SESSION_BACKUP_KEY);
+    const existing = existingWrap[ROLLING_SESSION_BACKUP_KEY];
+    const existingItems = Array.isArray(existing?.items) ? existing.items : [];
 
     const tabs = (await chrome.tabs.query({})).sort((a, b) => (
       (a.windowId - b.windowId) || (a.index - b.index)
@@ -1310,18 +1512,70 @@ async function captureDailySessionSnapshot({ force = false, reason = 'daily' } =
       items.push(entry);
     }
 
-    const count = await persistBoundedList(storageKey, items, DAILY_SESSION_SNAPSHOT_MAX_ENTRIES);
-    const storedItems = count === items.length ? items : (await chrome.storage.local.get(storageKey))[storageKey] || [];
+    const storedItems = items.slice(0, DAILY_SESSION_SNAPSHOT_MAX_ENTRIES);
+    const fingerprint = sessionBackupFingerprint(storedItems);
+    if (!force && existingItems.length && sessionBackupFingerprint(existingItems) === fingerprint) {
+      return {
+        created: false,
+        updated: false,
+        key: ROLLING_SESSION_BACKUP_KEY,
+        date,
+        savedAt: existing.savedAt || batchId,
+        count: existing.count || existingItems.length,
+        groupCount: existing.groupCount || 0,
+        reason: existing.reason || reason,
+        items: existingItems,
+      };
+    }
+
     const groupCount = new Set(storedItems.map((entry) => entry.groupKey).filter(Boolean)).size;
-    const meta = { key: storageKey, date, savedAt: batchId, count, groupCount, reason };
-    const nextCatalog = [...catalog.filter((entry) => entry.key !== storageKey), meta]
-      .sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
-    await chrome.storage.local.set({
-      [DAILY_SESSION_SNAPSHOT_CATALOG]: nextCatalog,
-      lastDailySessionSnapshotAt: batchId,
-    });
+    let written = storedItems;
+    while (written.length > 0) {
+      const payload = {
+        savedAt: batchId,
+        count: written.length,
+        groupCount,
+        reason,
+        items: written,
+      };
+      try {
+        await chrome.storage.local.set({
+          [ROLLING_SESSION_BACKUP_KEY]: payload,
+          lastDailySessionSnapshotAt: batchId,
+        });
+        break;
+      } catch (e) {
+        if (!isQuotaExceededError(e)) throw e;
+        const reducedSize = Math.floor(written.length * 0.75);
+        if (reducedSize === written.length) throw e;
+        written = written.slice(0, Math.max(1, reducedSize));
+      }
+    }
+    if (!written.length) {
+      await chrome.storage.local.set({
+        [ROLLING_SESSION_BACKUP_KEY]: {
+          savedAt: batchId,
+          count: 0,
+          groupCount: 0,
+          reason,
+          items: [],
+        },
+        lastDailySessionSnapshotAt: batchId,
+      });
+    }
     await pruneDailySessionSnapshots();
-    return { created: true, ...meta };
+    await pruneOldBackups();
+    return {
+      created: true,
+      updated: true,
+      key: ROLLING_SESSION_BACKUP_KEY,
+      date,
+      savedAt: batchId,
+      count: written.length,
+      groupCount,
+      reason,
+      items: written,
+    };
   })().finally(() => {
     dailySessionSnapshotPromise = null;
   });
@@ -1414,18 +1668,6 @@ async function archiveOrphanedSuspendedStorage() {
         merged.push(entry);
       }
       await persistBoundedList('orphanedSuspendedArchive', merged, ORPHANED_SUSPENDED_ARCHIVE_MAX);
-      try {
-        const folderId = await getOrCreateEmergencyRecoveryFolder();
-        for (const entry of archive) {
-          await chrome.bookmarks.create({
-            parentId: folderId,
-            title: (entry.title || entry.url).slice(0, 255),
-            url: entry.url,
-          });
-        }
-      } catch (e) {
-        console.warn('[TabHibernate] emergency bookmark archive failed', e);
-      }
     }
     if (keysToRemove.length) await chrome.storage.local.remove(keysToRemove);
     if (archive.length) await persistSuspendedUrlIndex(nextIndex);
@@ -1456,65 +1698,11 @@ async function getOrCreateEmergencyRecoveryFolder() {
   return created.id;
 }
 
-/** Snapshot all restorable tabs before extension update. */
+/** Update the same rolling backup used by Back up tabs. No extra dated folder. */
 async function runEmergencySessionBackup(reason = 'manual') {
   try {
-    await captureDailySessionSnapshot({ reason });
-    const tabs = await chrome.tabs.query({});
-    const seen = new Set();
-    const items = [];
-    const batchId = Date.now();
-    const groupMeta = await buildGroupMetaMapForTabs(tabs, batchId);
-    for (const tab of tabs) {
-      if (!tab?.id) continue;
-      let url = tab.pendingUrl || tab.url || '';
-      if (isPlaceholderTabUrl(url) || isSuspendedPlaceholderUrl(url)) {
-        url = (await getPlaceholderRestoreUrl(tab)) || '';
-        if (!url) {
-          try {
-            const u = new URL(tab.url || '');
-            url = u.searchParams.get('u') || '';
-          } catch (_) {}
-        }
-      }
-      if (!hasRestorableUrl(url) || seen.has(url)) continue;
-      seen.add(url);
-      let entry = {
-        url,
-        title: tab.title || url,
-        windowId: tab.windowId,
-      };
-      entry = copyGroupMetaToEntry(entry, groupMeta.get(tab.id));
-      items.push(entry);
-    }
-    if (!items.length) return { count: 0 };
-
-    const snapshot = { savedAt: Date.now(), reason, items };
-    const { emergencySessionBackups = [] } = await chrome.storage.local.get('emergencySessionBackups');
-    const nextBackups = [...emergencySessionBackups, snapshot].slice(-EMERGENCY_SESSION_BACKUPS_MAX);
-    await chrome.storage.local.set({ emergencySessionBackups: nextBackups, lastEmergencyBackupAt: snapshot.savedAt });
-
-    try {
-      const folderId = await getOrCreateEmergencyRecoveryFolder();
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const batchFolder = await chrome.bookmarks.create({
-        parentId: folderId,
-        title: `${stamp} (${reason})`,
-      });
-      for (const item of items) {
-        await chrome.bookmarks.create({
-          parentId: batchFolder.id,
-          title: (item.title || item.url).slice(0, 255),
-          url: item.url,
-        });
-      }
-    } catch (e) {
-      console.warn('[TabHibernate] emergency session bookmarks failed', e);
-    }
-
-    const dateStr = new Date().toISOString().slice(0, 10);
-    await runBackup('emergency');
-    return { count: items.length, dateStr };
+    const result = await runBackup(reason);
+    return { count: result.count || 0, folderPath: result.folderPath || null };
   } catch (e) {
     console.warn('[TabHibernate] runEmergencySessionBackup failed', e);
     return { count: 0, error: String(e?.message || e) };
@@ -1542,11 +1730,13 @@ async function collectRecoverableTabItems() {
     'emergencySessionBackups',
     BACKUP_KEY_CATALOG,
     DAILY_SESSION_SNAPSHOT_CATALOG,
+    ROLLING_SESSION_BACKUP_KEY,
   ]);
   for (const entry of Object.values(base[SUSPENDED_URL_INDEX] || {})) add(entry);
   for (const entry of base.orphanedSuspendedArchive || []) add(entry);
   for (const entry of base.closedAndSaved || []) add(entry);
   for (const entry of base.blockedTabsSaved || []) add(entry);
+  for (const entry of base[ROLLING_SESSION_BACKUP_KEY]?.items || []) add(entry);
   for (const snap of base.emergencySessionBackups || []) {
     for (const entry of snap.items || []) add(entry);
   }
@@ -1572,11 +1762,10 @@ async function collectRecoverableTabItems() {
     const walk = (nodes, insideBackupTree) => {
       if (!nodes) return;
       for (const n of nodes) {
-        if (n.url) add(n.url, n.title);
-        const enter = insideBackupTree
-          || bookmarkRoots.has(n.title)
-          || (n.title && /^\d{4}-\d{2}-\d{2}/.test(n.title))
-          || (n.title && /^\d{4}-\d{2}-\d{2}T/.test(n.title));
+        if (n.url) {
+          if (insideBackupTree) add(n.url, n.title);
+        }
+        const enter = insideBackupTree || bookmarkRoots.has(n.title);
         if (enter) walk(n.children, true);
       }
     };
@@ -1590,81 +1779,47 @@ async function collectRecoverableTabItems() {
 
 /** Delay between tabs in batch suspend to avoid freezing the browser. */
 const SUSPEND_BATCH_DELAY_MS = 80;
+/** Automatic hibernation must not walk an entire large session in one alarm. */
+const ALARM_SUSPEND_MAX_PER_RUN = 12;
+/** One explicit Suspend all click. The next click continues the rest. */
+const SUSPEND_ALL_MAX_PER_RUN = 30;
 
-/** Manually suspend all eligible tabs (no inactivity timeout check). Batched with delay to avoid browser freeze. */
+/** Manually suspend eligible tabs in a bounded batch so a huge session cannot freeze Chrome. */
 async function runSuspendAllNow() {
   await captureDailySessionSnapshot({ reason: 'before-suspend-all' });
   await getStoredState();
   const settings = await getSettings();
   const tabs = await chrome.tabs.query({});
-  const groupMeta = await buildGroupMetaMapForTabs(tabs, Date.now());
-  const toBackup = [];
   const suspendedPairs = [];
   let suspended = 0;
   for (const tab of tabs) {
+    if (suspended >= SUSPEND_ALL_MAX_PER_RUN) break;
     if (!(await isTabEligibleForSuspend(tab, { settings }))) continue;
     if (isTabExcludedByDomain(tab, settings.excludedDomains)) continue;
     const mode = getSuspendModeForTab(settings, tab);
     if (mode === 'placeholder' && !hasRestorableUrl(tab.url)) continue;
+    const groupMeta = await buildGroupMetaMapForTabs([tab]);
     if (mode === 'discard') {
       const ok = await suspendDiscard(tab.id, { deferBadge: true });
-      if (ok) {
-        toBackup.push({ url: tab.url, title: tab.title });
-        suspended++;
-      }
+      if (ok) suspended++;
     } else {
       const ok = await suspendPlaceholder(tab.id, tab.url, tab.title, tab.favIconUrl, {
         groupId: tab.groupId,
         windowId: tab.windowId,
         deferBadge: true,
+        skipBookmark: true,
         ...pickSavedGroupFields(groupMeta.get(tab.id)),
       });
       if (ok) {
-        toBackup.push({ url: tab.url, title: tab.title });
         suspendedPairs.push({ tabId: tab.id, item: groupMeta.get(tab.id) });
         suspended++;
       }
     }
-    if (suspended > 0 && suspended % 20 === 0) {
-      await new Promise((r) => setTimeout(r, SUSPEND_BATCH_DELAY_MS));
-    }
+    if (suspended > 0) await new Promise((r) => setTimeout(r, SUSPEND_BATCH_DELAY_MS));
   }
   await applySavedTabGroups(suspendedPairs, { forceRegroup: true });
   await updateBadge();
-  if (toBackup.length > 0) {
-    const seen = new Set();
-    const unique = toBackup.filter((t) => {
-      const key = normalizeUrlKey(t.url);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    const folderId = await getOrCreateBackupFolder();
-    for (const t of unique) {
-      try {
-        await chrome.bookmarks.create({
-          parentId: folderId,
-          title: (t.title || t.url).slice(0, 255),
-          url: t.url,
-        });
-      } catch (e) {
-        console.warn('[TabHibernate] backup bookmark failed', e);
-      }
-    }
-    const backupKey = `backup_${new Date().toISOString().slice(0, 10)}`;
-    const existing = await chrome.storage.local.get(backupKey);
-    const list = existing[backupKey] || [];
-    const existingUrls = new Set(list.map((x) => normalizeUrlKey(x.url)).filter(Boolean));
-    for (const t of unique) {
-      const key = normalizeUrlKey(t.url);
-      if (key && !existingUrls.has(key)) {
-        list.push({ url: t.url, title: t.title || t.url, ts: Date.now() });
-        existingUrls.add(key);
-      }
-    }
-    await persistBoundedList(backupKey, list, BACKUP_ENTRIES_MAX);
-  }
-  return { suspended };
+  return { suspended, capped: suspended >= SUSPEND_ALL_MAX_PER_RUN };
 }
 
 /** Placeholder restore URL: storage by tab.id, tabId in URL, or ?u= */
@@ -2468,6 +2623,7 @@ async function runRestoreAllSuspended() {
 
 /** Discard background tabs — same rules as TabMemoryCleaner (`tmcSettings`). */
 const DISCARD_DELAY_MS = 300;
+const DISCARD_MAX_PER_RUN = 40;
 const TMC_DEFAULT_SETTINGS = {
   skipPinned: false,
   skipAudible: true,
@@ -2518,7 +2674,7 @@ async function getTmcDiscardSettings() {
 async function runDiscardBackgroundTabs() {
   const opts = await getTmcDiscardSettings();
   const tabs = await chrome.tabs.query({});
-  const toDiscard = tabs.filter((tab) => {
+  const matched = tabs.filter((tab) => {
     if (!tab.id) return false;
     const u = (tab.url || '').toLowerCase();
     if (u.startsWith('chrome://') || u.startsWith('chrome-extension://')) return false;
@@ -2533,6 +2689,7 @@ async function runDiscardBackgroundTabs() {
     } catch (_) {}
     return true;
   });
+  const toDiscard = matched.slice(0, DISCARD_MAX_PER_RUN);
   let discarded = 0;
   for (const tab of toDiscard) {
     try {
@@ -2543,7 +2700,12 @@ async function runDiscardBackgroundTabs() {
       console.warn('[Memory] discard failed', tab.id, e);
     }
   }
-  return { discarded, total: toDiscard.length };
+  return {
+    discarded,
+    total: matched.length,
+    remaining: Math.max(0, matched.length - discarded),
+    capped: matched.length > discarded,
+  };
 }
 
 /**
@@ -2665,14 +2827,30 @@ async function runOpenUrlsAsPlaceholders(items, {
   return { opened, failed, errors, openedItems: created.map(({ item }) => item) };
 }
 
-/** Restore a daily point: regroup matching open tabs and open only URLs that are missing. */
+/** Restore the rolling session backup, or a legacy daily point if one is still stored. */
 async function runRestoreDailySessionSnapshot(storageKey) {
-  const catalogData = await chrome.storage.local.get(DAILY_SESSION_SNAPSHOT_CATALOG);
+  const catalogData = await chrome.storage.local.get([
+    DAILY_SESSION_SNAPSHOT_CATALOG,
+    ROLLING_SESSION_BACKUP_KEY,
+  ]);
   const catalog = normalizeDailySnapshotCatalog(catalogData[DAILY_SESSION_SNAPSHOT_CATALOG]);
-  const meta = catalog.find((entry) => entry.key === storageKey);
+  const rolling = catalogData[ROLLING_SESSION_BACKUP_KEY];
+  let meta = catalog.find((entry) => entry.key === storageKey);
+  if (!meta && storageKey === ROLLING_SESSION_BACKUP_KEY && rolling) {
+    meta = {
+      key: ROLLING_SESSION_BACKUP_KEY,
+      date: 'Current',
+      savedAt: rolling.savedAt,
+      count: rolling.count,
+      groupCount: rolling.groupCount,
+    };
+  }
   if (!meta) return { opened: 0, regrouped: 0, error: 'Recovery point not found' };
-  const stored = await chrome.storage.local.get(storageKey);
-  const items = Array.isArray(stored[storageKey]) ? stored[storageKey] : [];
+  const stored = storageKey === ROLLING_SESSION_BACKUP_KEY
+    ? { [storageKey]: rolling }
+    : await chrome.storage.local.get(storageKey);
+  const raw = stored[storageKey];
+  const items = Array.isArray(raw) ? raw : (Array.isArray(raw?.items) ? raw.items : []);
   if (!items.length) return { opened: 0, regrouped: 0, error: 'Recovery point is empty' };
 
   const tabs = await chrome.tabs.query({});
@@ -2818,49 +2996,9 @@ async function runRecoverFromBrowserHistory(options) {
   };
 }
 
-async function persistAlarmBackupEntries(toBackup) {
-  if (!toBackup.length) return;
-  try {
-    const seen = new Set();
-    const unique = toBackup.filter((t) => {
-      const key = normalizeUrlKey(t.url);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    if (!unique.length) return;
-
-    try {
-      const folderId = await getOrCreateBackupFolder();
-      for (const t of unique) {
-        try {
-          await chrome.bookmarks.create({
-            parentId: folderId,
-            title: (t.title || t.url).slice(0, 255),
-            url: t.url,
-          });
-        } catch (e) {
-          console.warn('[TabHibernate] backup bookmark failed', e);
-        }
-      }
-    } catch (e) {
-      console.warn('[TabHibernate] backup bookmark folder failed', e);
-    }
-
-    const backupKey = `backup_${new Date().toISOString().slice(0, 10)}`;
-    const existing = await chrome.storage.local.get(backupKey);
-    const list = existing[backupKey] || [];
-    const existingUrls = new Set(list.map((x) => normalizeUrlKey(x.url)).filter(Boolean));
-    for (const t of unique) {
-      const key = normalizeUrlKey(t.url);
-      if (!key || existingUrls.has(key)) continue;
-      list.push({ url: t.url, title: t.title || t.url, ts: Date.now() });
-      existingUrls.add(key);
-    }
-    await persistBoundedList(backupKey, list, BACKUP_ENTRIES_MAX);
-  } catch (e) {
-    console.warn('[TabHibernate] persistAlarmBackupEntries failed', e);
-  }
+/** Automatic hibernation no longer appends bookmarks or dated backup lists. */
+async function persistAlarmBackupEntries() {
+  return;
 }
 
 async function getFocusedNormalWindowId() {
@@ -2875,8 +3013,12 @@ async function getFocusedNormalWindowId() {
 /** Maintenance must never prevent the inactivity check from running. */
 async function runAlarmMaintenance() {
   const now = Date.now();
-  if (now - lastLightMaintenanceAt < LIGHT_MAINTENANCE_INTERVAL_MS) return;
-  lastLightMaintenanceAt = now;
+  const stored = await chrome.storage.local.get(LAST_LIGHT_MAINTENANCE_AT);
+  const lastRun = Number(stored[LAST_LIGHT_MAINTENANCE_AT] || 0);
+  if (now - lastRun < LIGHT_MAINTENANCE_INTERVAL_MS) return;
+  // Persist before the work starts so an interrupted MV3 worker does not
+  // repeat the full maintenance scan on its next wake.
+  await chrome.storage.local.set({ [LAST_LIGHT_MAINTENANCE_AT]: now });
   const tasks = [
     pruneStaleTabIds,
     pruneChromeGroupKeyRegistry,
@@ -2907,13 +3049,12 @@ async function onAlarmCheck() {
 
     const tabs = await chrome.tabs.query({});
     const focusedWindowId = await getFocusedNormalWindowId();
-    const groupMeta = await buildGroupMetaMapForTabs(tabs, Date.now());
     if (seedActivityForUnknownTabs(tabs)) await persistLastActivity(true);
 
-    const toBackup = [];
     const suspendedPairs = [];
     let suspendedThisRun = 0;
     for (const tab of tabs) {
+      if (suspendedThisRun >= ALARM_SUSPEND_MAX_PER_RUN) break;
       const allowBackgroundActive = SwissCore.shouldAllowActiveTabInAlarm(tab, focusedWindowId);
       if (!(await isTabEligibleForSuspend(tab, { settings, allowActive: allowBackgroundActive }))) continue;
       if (isTabExcludedByDomain(tab, settings.excludedDomains)) continue;
@@ -2921,30 +3062,31 @@ async function onAlarmCheck() {
       const mode = getSuspendModeForTab(settings, tab);
       if (mode === 'placeholder' && !hasRestorableUrl(tab.url)) continue;
 
+      const groupMeta = await buildGroupMetaMapForTabs([tab]);
       if (mode === 'discard') {
         const ok = await suspendDiscard(tab.id, { deferBadge: true });
-        if (ok) { toBackup.push({ url: tab.url, title: tab.title }); suspendedThisRun++; }
+        if (ok) suspendedThisRun++;
       } else {
         const ok = await suspendPlaceholder(tab.id, tab.url, tab.title, tab.favIconUrl, {
           groupId: tab.groupId,
           windowId: tab.windowId,
           deferBadge: true,
+          skipBookmark: true,
           ...pickSavedGroupFields(groupMeta.get(tab.id)),
         });
         if (ok) {
-          toBackup.push({ url: tab.url, title: tab.title });
           suspendedPairs.push({ tabId: tab.id, item: groupMeta.get(tab.id) });
           suspendedThisRun++;
         }
       }
-      if (suspendedThisRun > 0 && suspendedThisRun % 15 === 0) {
+      if (suspendedThisRun > 0) {
         await new Promise((r) => setTimeout(r, SUSPEND_BATCH_DELAY_MS));
       }
     }
 
     await applySavedTabGroups(suspendedPairs, { forceRegroup: true });
-    await updateBadge();
-    await persistAlarmBackupEntries(toBackup);
+    if (suspendedThisRun) await updateBadge();
+    await persistAlarmBackupEntries();
   } catch (e) {
     console.warn('[TabHibernate] onAlarmCheck failed', e);
   } finally {
@@ -3023,7 +3165,7 @@ async function rebindPlaceholderStorageKeys() {
         console.warn('[TabHibernate] collect placeholder group data failed', tab.id, e);
       }
     }
-    if (forGrouping.length) await applySavedTabGroups(forGrouping, { forceRegroup: true });
+    if (forGrouping.length) await applySavedTabGroups(forGrouping, { forceRegroup: false });
     await pruneChromeGroupKeyRegistry();
   } catch (e) {
     console.warn('[TabHibernate] rebindPlaceholderStorageKeys failed', e);
@@ -3104,7 +3246,7 @@ async function migrateOrphanedSuspendedTabs({ repairCurrent = false } = {}) {
         return true;
       });
     }
-    if (repairedGroups.length) await applySavedTabGroups(repairedGroups, { forceRegroup: true });
+    if (repairedGroups.length) await applySavedTabGroups(repairedGroups, { forceRegroup: false });
     return repaired;
   } catch (e) {
     console.warn('[TabHibernate] migrateOrphanedSuspendedTabs failed', e);
@@ -3197,6 +3339,10 @@ function ensureServiceWorkerReady() {
 async function initOnStartup() {
   swReadyPromise = null;
   await ensureServiceWorkerReady();
+  // Never wake discarded placeholders just to refresh their favicons. Large
+  // restored sessions can otherwise start many renderer processes at once and
+  // exhaust Chrome's memory. The favicon bootstrap runs naturally when a user
+  // activates a discarded placeholder.
   await compactSuspendedUrlIndex();
   await pruneDuplicateSavedLists();
   await captureDailySessionSnapshot({ reason: 'browser-startup' });
@@ -3267,6 +3413,27 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === FAVICON_REFRESH_ALARM) {
+    processNextSuspendedFaviconRefresh().catch(async (e) => {
+      console.warn('[TabHibernate] favicon refresh job failed', e);
+      const stored = await chrome.storage.local.get(FAVICON_REFRESH_JOB_KEY).catch(() => ({}));
+      const job = stored[FAVICON_REFRESH_JOB_KEY];
+      await chrome.storage.local.set({
+        [FAVICON_REFRESH_PROGRESS_KEY]: {
+          status: 'error',
+          done: Number(job?.index) || 0,
+          total: Array.isArray(job?.tabIds) ? job.tabIds.length : 0,
+          refreshed: Number(job?.refreshed) || 0,
+          failed: Number(job?.failed) || 0,
+          remaining: Number(job?.remaining) || 0,
+          skippedActive: Number(job?.skippedActive) || 0,
+          error: String(e?.message || e),
+        },
+      }).catch(() => {});
+      await chrome.storage.local.remove(FAVICON_REFRESH_JOB_KEY).catch(() => {});
+    });
+    return;
+  }
   if (alarm.name.startsWith(RESTORE_ALLOW_RULE_ALARM_PREFIX)) {
     const ruleId = Number(alarm.name.slice(RESTORE_ALLOW_RULE_ALARM_PREFIX.length));
     removeRestoreAllowRule(ruleId).catch(() => {});
@@ -3378,6 +3545,11 @@ if (chrome.tabGroups?.onUpdated) {
   chrome.tabGroups.onUpdated.addListener((group) => {
     if (!group?.id) return;
     chrome.tabs.query({ groupId: group.id }).then((tabs) => {
+      const now = Date.now();
+      const transitioning = tabs.some((tab) => (placeholderGroupTransitionUntil.get(tab.id) || 0) > now);
+      // Chrome expands a group while a tab navigates to the placeholder.
+      // Do not store that transient open state or the next pass will reopen it.
+      if (transitioning && group.collapsed !== true) return;
       for (const tab of tabs) syncSuspendedStorageGroupMetaForTab(tab).catch(() => {});
     }).catch(() => {});
   });
@@ -3967,18 +4139,30 @@ async function unblockSiteForRestore(url, tabId) {
   return { unblocked: true, domain: matchedDomain, allowRuleId };
 }
 
+function canReloadBlockedTab(tabId) {
+  return (blockerReloadCooldownUntil.get(tabId) || 0) <= Date.now();
+}
+
+function markBlockedTabReloaded(tabId) {
+  blockerReloadCooldownUntil.set(tabId, Date.now() + BLOCKER_RELOAD_COOLDOWN_MS);
+}
+
 async function siteBlockerReloadBlockedOpenTabs(domains) {
   if (!domains?.length) return;
   const tabs = await chrome.tabs.query({});
+  let reloaded = 0;
   for (const tab of tabs) {
-    if (!tab?.id) continue;
+    if (reloaded >= BLOCKER_RELOAD_MAX_PER_RUN) break;
+    if (!tab?.id || !canReloadBlockedTab(tab.id)) continue;
     const url = tab.url || '';
     if (isPlaceholderTabUrl(url) || isSuspendedPlaceholderUrl(url)) continue;
     if (isChromeBlockedPageUrl(url)) continue;
     if (!sbUrlMatchesBlockedDomains(url, domains)) continue;
     await rememberBlockerTabUrl(tab.id, url, tab.title);
+    markBlockedTabReloaded(tab.id);
     try {
       await chrome.tabs.reload(tab.id, { bypassCache: true });
+      reloaded++;
     } catch (e) {
       console.warn('[SiteBlocker] reload blocked tab failed', tab.id, e);
     }
@@ -3999,9 +4183,11 @@ async function maybeReloadTabIfBlocked(tab) {
   if (isPlaceholderTabUrl(url) || isSuspendedPlaceholderUrl(url)) return;
   if (isChromeBlockedPageUrl(url)) return;
   if (!url.startsWith('http://') && !url.startsWith('https://')) return;
+  if (!canReloadBlockedTab(tab.id)) return;
   const domains = await getActiveBlockerDomains();
   if (!domains.length || !sbUrlMatchesBlockedDomains(url, domains)) return;
   await rememberBlockerTabUrl(tab.id, url, tab.title);
+  markBlockedTabReloaded(tab.id);
   try {
     await chrome.tabs.reload(tab.id, { bypassCache: true });
   } catch (e) {
@@ -4059,6 +4245,7 @@ async function siteBlockerApplyRulesImpl({ enforceOpenTabs = false, forceApply =
     schedule = SB_DEFAULT_SCHEDULE,
     scheduleStateActive: previousScheduleStateActive,
     [SITE_BLOCKER_RULE_SIGNATURE_KEY]: previousRuleSignature = '',
+    [BLOCKER_OPEN_TAB_ENFORCE_AT_KEY]: previousOpenTabEnforceAt = 0,
   } = await chrome.storage.local.get([
     'blocked',
     'whitelist',
@@ -4066,6 +4253,7 @@ async function siteBlockerApplyRulesImpl({ enforceOpenTabs = false, forceApply =
     'schedule',
     'scheduleStateActive',
     SITE_BLOCKER_RULE_SIGNATURE_KEY,
+    BLOCKER_OPEN_TAB_ENFORCE_AT_KEY,
   ]);
 
   const normalizedSchedule = sbNormalizeSchedule(schedule);
@@ -4088,9 +4276,9 @@ async function siteBlockerApplyRulesImpl({ enforceOpenTabs = false, forceApply =
   if (!forceApply && !enforceOpenTabs && previousRuleSignature === ruleSignature) {
     const shouldPeriodicReload = blockingWindowActive
       && domains.length > 0
-      && (Date.now() - lastBlockerOpenTabEnforceAt >= BLOCKER_OPEN_TAB_ENFORCE_MS);
+      && (Date.now() - Number(previousOpenTabEnforceAt || 0) >= BLOCKER_OPEN_TAB_ENFORCE_MS);
     if (shouldPeriodicReload) {
-      lastBlockerOpenTabEnforceAt = Date.now();
+      await chrome.storage.local.set({ [BLOCKER_OPEN_TAB_ENFORCE_AT_KEY]: Date.now() });
       await siteBlockerReloadBlockedOpenTabs(domains);
     }
     return;
@@ -4106,7 +4294,9 @@ async function siteBlockerApplyRulesImpl({ enforceOpenTabs = false, forceApply =
   const toRemove = existing.map((r) => r.id).filter((id) => id >= SITE_BLOCKER_RULE_ID_START);
 
   if (!blockingWindowActive) {
-    await preserveBlockedOpenTabs('blocking-off', { convertToPlaceholder: true });
+    // Disabling the blocker or leaving its schedule must not navigate the
+    // user's open pages. Preserve recovery metadata without hibernating tabs.
+    await preserveBlockedOpenTabs('blocking-off', { convertToPlaceholder: false });
     try {
       await chrome.declarativeNetRequest.updateEnabledRulesets({ disableRulesetIds: NETFILTER_RULESET_IDS });
     } catch (e) {
@@ -4218,12 +4408,12 @@ async function siteBlockerApplyRulesImpl({ enforceOpenTabs = false, forceApply =
   const shouldPeriodicReload = !shouldReloadOpenTabs
     && blockingWindowActive
     && domains.length > 0
-    && (Date.now() - lastBlockerOpenTabEnforceAt >= BLOCKER_OPEN_TAB_ENFORCE_MS);
+    && (Date.now() - Number(previousOpenTabEnforceAt || 0) >= BLOCKER_OPEN_TAB_ENFORCE_MS);
   if (shouldReloadOpenTabs || shouldPeriodicReload) {
     if (shouldReloadOpenTabs) {
       await maybeAutoSaveBlockedTabs(domains, 'before-reload');
     }
-    lastBlockerOpenTabEnforceAt = Date.now();
+    await chrome.storage.local.set({ [BLOCKER_OPEN_TAB_ENFORCE_AT_KEY]: Date.now() });
     await siteBlockerReloadBlockedOpenTabs(domains);
   }
 }
@@ -4351,16 +4541,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === 'getDailySessionSnapshots') {
     (async () => {
-      const stored = await chrome.storage.local.get(DAILY_SESSION_SNAPSHOT_CATALOG);
-      const snapshots = normalizeDailySnapshotCatalog(stored[DAILY_SESSION_SNAPSHOT_CATALOG])
-        .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
-      safeSend({ snapshots, retentionDays: BACKUP_RETENTION_DAYS });
+      const stored = await chrome.storage.local.get([
+        DAILY_SESSION_SNAPSHOT_CATALOG,
+        ROLLING_SESSION_BACKUP_KEY,
+      ]);
+      const rolling = stored[ROLLING_SESSION_BACKUP_KEY];
+      const snapshots = [];
+      if (rolling && (rolling.count || (Array.isArray(rolling.items) && rolling.items.length))) {
+        snapshots.push({
+          key: ROLLING_SESSION_BACKUP_KEY,
+          date: 'Current',
+          savedAt: rolling.savedAt,
+          count: rolling.count || rolling.items.length,
+          groupCount: rolling.groupCount || 0,
+          reason: rolling.reason || 'current',
+        });
+      }
+      for (const entry of normalizeDailySnapshotCatalog(stored[DAILY_SESSION_SNAPSHOT_CATALOG])) {
+        if (entry.key !== ROLLING_SESSION_BACKUP_KEY) snapshots.push(entry);
+      }
+      safeSend({ snapshots, retentionDays: 1 });
     })().catch((e) => safeSend({ snapshots: [], error: String(e?.message || e) }));
     return true;
   }
   if (msg.type === 'captureDailySessionSnapshot') {
     captureDailySessionSnapshot({ reason: 'manual' })
-      .then((result) => safeSend(result))
+      .then((result) => {
+        const safe = { ...(result || {}) };
+        delete safe.items;
+        safeSend(safe);
+      })
       .catch((e) => safeSend({ created: false, error: String(e?.message || e) }));
     return true;
   }
@@ -4417,6 +4627,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then((s) => ensureAlarm(s.checkPeriodMinutes))
       .then(() => safeSend({ ok: true }))
       .catch(() => safeSend({ ok: false }));
+    return true;
+  }
+  if (msg.type === 'refreshSuspendedFavicons') {
+    (async () => {
+      try {
+        const result = await startSuspendedFaviconRefresh();
+        // Close the message channel before the first tab is loaded. The job is
+        // already persisted and has an alarm fallback at this point.
+        safeSend(result);
+        if (result.started && !result.alreadyRunning) {
+          try {
+            await processNextSuspendedFaviconRefresh();
+          } catch (e) {
+            // The watchdog alarm retries the persisted cursor.
+            console.warn('[TabHibernate] initial favicon refresh step failed', e);
+          }
+        }
+      } catch (e) {
+        console.warn('[TabHibernate] refreshSuspendedFavicons failed', e);
+        safeSend({ started: false, error: String(e?.message || e) });
+      }
+    })();
     return true;
   }
   if (msg.type === 'removeSuspendedBookmark') {
@@ -4645,87 +4877,110 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     captureInProgress = true;
     (async () => {
-      const SCROLL_DELAY_MS = 1500, FIRST_FRAME_DELAY_MS = 500;
-      const cap = {
-        getActiveTab: async () => { const [t] = await chrome.tabs.query({ active: true, currentWindow: true }); if (!t?.id) throw new Error('No active tab'); return t; },
-        inject: (tid) => chrome.scripting.executeScript({ target: { tabId: tid }, files: ['content.js'] }),
-        getPageHeight: (tid) => chrome.tabs.sendMessage(tid, { type: 'getPageHeight' }).then(r => r.height),
-        getViewportHeight: (tid) => chrome.tabs.sendMessage(tid, { type: 'getViewportHeight' }).then(r => r.height),
-        getScrollPosition: (tid) => chrome.tabs.sendMessage(tid, { type: 'getScrollPosition' }).then(r => r.y),
-        scrollTo: (tid, y) => chrome.tabs.sendMessage(tid, { type: 'scrollTo', y }),
-        hideFloating: (tid) => chrome.tabs.sendMessage(tid, { type: 'hideFloating' }),
-        showFloating: (tid) => chrome.tabs.sendMessage(tid, { type: 'showFloating' }).catch(() => {}),
-      };
-      const saveToIDB = (data) => new Promise((res, rej) => {
-        const r = indexedDB.open('PdfCaptureDB', 1);
-        r.onerror = () => rej(r.error);
-        r.onsuccess = () => {
-          const db = r.result;
-          const tx = db.transaction('capture', 'readwrite');
-          const store = tx.objectStore('capture');
-          store.put(data, 'pending');
-          tx.oncomplete = () => { db.close(); res(); };
-          tx.onerror = () => { db.close(); rej(tx.error); };
-        };
-        r.onupgradeneeded = (e) => e.target.result.createObjectStore('capture');
-      });
-      let tabId = null;
-      let originalScrollY = 0;
+      let ownsCaptureState = false;
       try {
-        const tab = await cap.getActiveTab();
-        tabId = tab.id;
-        if (!tab.url) {
-          await saveToIDB({ error: 'No open page.' });
-          chrome.tabs.create({ url: chrome.runtime.getURL('ui-dist/result.html'), index: tab.index + 1, windowId: tab.windowId });
-          safeSend({ error: 'No open page.' }); return;
+        const storedState = await chrome.storage.session.get(CAPTURE_STATE_KEY);
+        const activeState = storedState[CAPTURE_STATE_KEY];
+        const activeSince = Number(activeState?.startedAt || 0);
+        if (activeState?.status === 'capturing'
+          && Date.now() - activeSince >= 0
+          && Date.now() - activeSince < CAPTURE_STATE_STALE_MS) {
+          safeSend({ error: 'A page capture is already in progress.' });
+          return;
         }
-        await cap.inject(tabId);
-        await new Promise(r => setTimeout(r, 200));
-        originalScrollY = await cap.getScrollPosition(tabId);
-        await cap.hideFloating(tabId);
-        await new Promise(r => setTimeout(r, 300));
-        await cap.scrollTo(tabId, 0);
-        await new Promise(r => setTimeout(r, 400));
-        const [pageH, viewH] = await Promise.all([cap.getPageHeight(tabId), cap.getViewportHeight(tabId)]);
-        const plan = SwissCore.getCapturePlan({
-          pageHeight: pageH,
-          viewportHeight: viewH,
-          viewportWidth: tab.width || 1920,
+        await chrome.storage.session.set({
+          [CAPTURE_STATE_KEY]: { status: 'capturing', startedAt: Date.now() },
         });
-        if (!plan.ok) throw new Error(plan.error);
-        const { step, totalFrames } = plan;
-        const setProgress = (current) => {
-          chrome.storage.local.set({ captureProgress: { total: totalFrames, current } });
+        ownsCaptureState = true;
+
+        const SCROLL_DELAY_MS = 1500, FIRST_FRAME_DELAY_MS = 500;
+        const cap = {
+          getActiveTab: async () => { const [t] = await chrome.tabs.query({ active: true, currentWindow: true }); if (!t?.id) throw new Error('No active tab'); return t; },
+          inject: (tid) => chrome.scripting.executeScript({ target: { tabId: tid }, files: ['content.js'] }),
+          getPageHeight: async (tid) => (await chrome.tabs.sendMessage(tid, { type: 'getPageHeight' })).height,
+          getViewportHeight: async (tid) => (await chrome.tabs.sendMessage(tid, { type: 'getViewportHeight' })).height,
+          getScrollPosition: async (tid) => (await chrome.tabs.sendMessage(tid, { type: 'getScrollPosition' })).y,
+          scrollTo: (tid, y) => chrome.tabs.sendMessage(tid, { type: 'scrollTo', y }),
+          hideFloating: (tid) => chrome.tabs.sendMessage(tid, { type: 'hideFloating' }),
+          showFloating: async (tid) => {
+            try { await chrome.tabs.sendMessage(tid, { type: 'showFloating' }); } catch (_) {}
+          },
         };
-        setProgress(0);
-        const tiles = [];
-        let y = 0, first = true;
-        while (tiles.length < totalFrames) {
-          await cap.scrollTo(tabId, y);
-          await new Promise(r => setTimeout(r, first ? FIRST_FRAME_DELAY_MS + SCROLL_DELAY_MS : SCROLL_DELAY_MS));
-          tiles.push(await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }));
-          setProgress(tiles.length);
-          y += step; first = false;
+        const saveToIDB = (data) => new Promise((res, rej) => {
+          const r = indexedDB.open('PdfCaptureDB', 1);
+          r.onerror = () => rej(r.error);
+          r.onsuccess = () => {
+            const db = r.result;
+            const tx = db.transaction('capture', 'readwrite');
+            const store = tx.objectStore('capture');
+            store.put(data, 'pending');
+            tx.oncomplete = () => { db.close(); res(); };
+            tx.onerror = () => { db.close(); rej(tx.error); };
+          };
+          r.onupgradeneeded = (e) => e.target.result.createObjectStore('capture');
+        });
+        let tabId = null;
+        let originalScrollY = 0;
+        try {
+          const tab = await cap.getActiveTab();
+          tabId = tab.id;
+          if (!tab.url) {
+            await saveToIDB({ error: 'No open page.' });
+            chrome.tabs.create({ url: chrome.runtime.getURL('ui-dist/result.html'), index: tab.index + 1, windowId: tab.windowId });
+            safeSend({ error: 'No open page.' }); return;
+          }
+          await cap.inject(tabId);
+          await new Promise(r => setTimeout(r, 200));
+          originalScrollY = await cap.getScrollPosition(tabId);
+          await cap.hideFloating(tabId);
+          await new Promise(r => setTimeout(r, 300));
+          await cap.scrollTo(tabId, 0);
+          await new Promise(r => setTimeout(r, 400));
+          const [pageH, viewH] = await Promise.all([cap.getPageHeight(tabId), cap.getViewportHeight(tabId)]);
+          const plan = SwissCore.getCapturePlan({
+            pageHeight: pageH,
+            viewportHeight: viewH,
+            viewportWidth: tab.width || 1920,
+          });
+          if (!plan.ok) throw new Error(plan.error);
+          const { step, totalFrames } = plan;
+          const setProgress = (current) => {
+            chrome.storage.local.set({ captureProgress: { total: totalFrames, current } });
+          };
+          setProgress(0);
+          const tiles = [];
+          let y = 0, first = true;
+          while (tiles.length < totalFrames) {
+            await cap.scrollTo(tabId, y);
+            await new Promise(r => setTimeout(r, first ? FIRST_FRAME_DELAY_MS + SCROLL_DELAY_MS : SCROLL_DELAY_MS));
+            tiles.push(await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }));
+            setProgress(tiles.length);
+            y += step; first = false;
+          }
+          await saveToIDB({ tiles, pageInfo: { url: tab.url, title: tab.title || '' } });
+          chrome.tabs.create({ url: chrome.runtime.getURL('ui-dist/result.html'), index: tab.index + 1, windowId: tab.windowId });
+          safeSend({ ok: true, count: tiles.length });
+        } catch (e) {
+          const errText = formatSwissCaptureError(e);
+          await saveToIDB({ error: errText });
+          let t = null; if (tabId) try { t = await chrome.tabs.get(tabId); } catch (_) {}
+          chrome.tabs.create({ url: chrome.runtime.getURL('ui-dist/result.html'), windowId: t?.windowId });
+          safeSend({ error: errText });
+        } finally {
+          await chrome.storage.local.remove('captureProgress').catch(() => {});
+          if (tabId) {
+            try { await cap.scrollTo(tabId, originalScrollY); } catch (_) {}
+            await cap.showFloating(tabId);
+          }
         }
-        await saveToIDB({ tiles, pageInfo: { url: tab.url, title: tab.title || '' } });
-        chrome.tabs.create({ url: chrome.runtime.getURL('ui-dist/result.html'), index: tab.index + 1, windowId: tab.windowId });
-        safeSend({ ok: true, count: tiles.length });
       } catch (e) {
-        const errText = formatSwissCaptureError(e);
-        await saveToIDB({ error: errText });
-        let t = null; if (tabId) try { t = await chrome.tabs.get(tabId); } catch (_) {}
-        chrome.tabs.create({ url: chrome.runtime.getURL('ui-dist/result.html'), windowId: t?.windowId });
-        safeSend({ error: errText });
+        console.warn('[PageCapture] unexpected capture failure', e);
+        safeSend({ error: formatSwissCaptureError(e) });
       } finally {
-        await chrome.storage.local.remove('captureProgress').catch(() => {});
-        if (tabId) {
-          try { await cap.scrollTo(tabId, originalScrollY); } catch (_) {}
-          try { await cap.showFloating(tabId); } catch (_) {}
-        }
+        if (ownsCaptureState) await chrome.storage.session.remove(CAPTURE_STATE_KEY).catch(() => {});
+        captureInProgress = false;
       }
-    })()
-      .catch((e) => console.warn('[PageCapture] unexpected capture failure', e))
-      .finally(() => { captureInProgress = false; });
+    })();
     return true;
   }
   return false;

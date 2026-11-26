@@ -13,9 +13,9 @@ fi
 
 VERSION="$(grep -E '"version"' "$ROOT/manifest.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
 OUT_DIR="$ROOT/dist"
-ZIP_NAME="SwissExtensions-v${VERSION}-chrome-store.zip"
+ZIP_NAME="RigiExtensions-v${VERSION}-chrome-store.zip"
 PUBLIC_OUT_DIR="$REPO_ROOT/downloads"
-PUBLIC_ZIP_NAME="SwissExtensions-v${VERSION}.zip"
+PUBLIC_ZIP_NAME="RigiExtensions-v${VERSION}.zip"
 STAGE="$(mktemp -d)"
 ARCHIVE_STAGE="$(mktemp -d)"
 
@@ -26,8 +26,8 @@ mkdir -p "$OUT_DIR"
 mkdir -p "$PUBLIC_OUT_DIR"
 
 # Keep only the package for the manifest version. Old ZIPs are easy to upload by mistake.
-find "$OUT_DIR" -maxdepth 1 -type f -name 'SwissExtensions-v*-chrome-store.zip' ! -name "$ZIP_NAME" -delete
-find "$PUBLIC_OUT_DIR" -maxdepth 1 -type f -name 'SwissExtensions-v*.zip' ! -name "$PUBLIC_ZIP_NAME" -delete
+find "$OUT_DIR" -maxdepth 1 -type f -name 'RigiExtensions-v*-chrome-store.zip' ! -name "$ZIP_NAME" -delete
+find "$PUBLIC_OUT_DIR" -maxdepth 1 -type f -name 'RigiExtensions-v*.zip' ! -name "$PUBLIC_ZIP_NAME" -delete
 
 if [[ ! -d "$ROOT/ui-dist" ]]; then
   echo "Missing ui-dist/. Build frontend/apps/swiss-ui first." >&2

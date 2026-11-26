@@ -1,6 +1,6 @@
-# Swiss Extensions — тексты для Chrome Web Store
+# Rigi Extensions — тексты для Chrome Web Store
 
-Версия пакета: **1.5.50** · [Developer Dashboard](https://chrome.google.com/webstore/devconsole)
+Версия пакета: **1.5.52** · [Developer Dashboard](https://chrome.google.com/webstore/devconsole)
 
 Privacy Policy: `https://github.com/navorina-labs/SwissExtensions/blob/main/PRIVACY_POLICY.md`
 
@@ -24,7 +24,7 @@ Capture, tab hibernate, RAM cleaner, site blocker with tab backup, history recov
 
 **EN — вставить в карточку Store:**
 
-Your browser shouldn’t feel like a second job. Swiss Extensions brings practical browser tools into one minimal side panel — so you move faster, use less RAM, and stay on task.
+Your browser shouldn’t feel like a second job. Rigi Extensions brings practical browser tools into one minimal side panel — so you move faster, use less RAM, and stay on task.
 
 What’s inside
 
@@ -58,7 +58,7 @@ No bloat. No noise. Built for people who live in many tabs and want performance 
 
 **RU (опционально, отдельная локаль):**
 
-Браузер не должен ощущаться второй работой. Swiss Extensions объединяет полезные инструменты в одной боковой панели: быстрее, меньше RAM, больше фокуса.
+Браузер не должен ощущаться второй работой. Rigi Extensions объединяет полезные инструменты в одной боковой панели: быстрее, меньше RAM, больше фокуса.
 
 **Внутри:** поиск по вкладкам, закладкам и истории; захват длинных страниц (PNG); гибернация вкладок с восстановлением; очистка RAM; блокировка сайтов; очистка данных текущего сайта.
 
@@ -70,21 +70,21 @@ No bloat. No noise. Built for people who live in many tabs and want performance 
 
 ---
 
-## What's new (Release notes) — version 1.5.50
+## What's new (Release notes) — version 1.5.52
 
 **EN (full):**
 ```
-Swiss Lens: save local readability preferences for each site. Increase text size, hide common distractions, use a high-contrast reading theme, and reduce page motion.
+Improves stability in large tab sessions: startup no longer wakes discarded tabs to refresh favicons, Page Capture keeps its lock across service-worker restarts, and disabling Site Blocker no longer replaces open pages with placeholders. Keyboard focus now returns to the selected tool after navigating back.
 ```
 
 **EN (short, if character limit):**
 ```
-Add Swiss Lens: local, per-site controls for text size, distractions, contrast, and motion.
+More stable large-tab startup, safer Page Capture, and predictable Site Blocker disable behavior.
 ```
 
 **RU:**
 ```
-Добавлен Swiss Lens: локальные настройки размера текста, чистого режима, контраста и движения для каждого сайта.
+Стабильнее запуск с большим числом вкладок, безопаснее Page Capture, а выключение Site Blocker больше не заменяет открытые страницы заглушками.
 ```
 
 ---
@@ -170,7 +170,7 @@ Tab Hibernate: таймер неактивности больше не сбра�
 
 **EN:**
 ```
-Productivity suite: page capture, tab lifecycle (hibernate, backup, recovery), memory discard, site blocking with local tab archives, and per-site data clearing — unified side panel and on-device storage only.
+Rigi Extensions is a local browser-workspace manager. It helps users manage and recover tabs, reduce tab memory use, capture pages, apply per-site readability settings, block distracting sites, and clear data for the current site from one side panel. All processing stays on the user's device.
 ```
 
 ---
@@ -221,22 +221,89 @@ Read/update tab group title, color, and membership when the user saves or restor
 
 ---
 
-## Permission justifications
+## Permission justifications — paste into the Privacy tab
 
-- **tabs** — Tab URLs for capture, hibernate, suspend/restore, memory discard, recovery flows, and opening result/history pages.
-- **tabGroups** — Save and restore tab group metadata (title, color, collapsed) when hibernating or closing tabs.
-- **activeTab** — Active tab when the user starts capture or site-data clear.
-- **host_permissions (`<all_urls>`)** — Capture and helpers on visited pages; hibernate and blocking on URLs the user loads or lists.
-- **scripting** — Inject capture scroll helper when the user starts Page Capture.
-- **downloads** — Save PNG exports to Downloads or a chosen folder.
-- **storage** — Settings, blocklists, tab recovery archives (`closedAndSaved`, `blockedTabsSaved`, backups) — all local.
-- **bookmarks** — Optional backups: Tab Hibernate, Site Blocker saved tabs, emergency recovery folders (user-triggered or auto-save on block).
-- **alarms** — Tab inactivity checks and Site Blocker schedule.
-- **history** — Recover lost tabs from Chrome browsing history; optional helper to pick blocked domains from past visits.
-- **browsingData** — Clear data for the current site only after user confirmation.
-- **sidePanel** — Main UI.
-- **declarativeNetRequest** — Built-in filter rulesets and user block rules; no remote rule downloads.
-- **webNavigation** — Read main-frame http(s) URL in onBeforeNavigate before Site Blocker DNR blocks the navigation, so the original page URL can be saved locally for tab recovery, History, placeholders, and “Group same URLs”.
+**favicon**
+```
+Used to display the original website icon on suspended and blocked-tab placeholders and in local recovery views. Chrome's built-in favicon service receives only the page URL on the user's device. Favicons are not sent to the developer or any external service.
+```
+
+**tabs**
+```
+Used to read tab URLs, titles, favicons, activity state, and group membership, and to create, update, discard, suspend, restore, and organize tabs. These actions power tab search, Page Capture, Tab Hibernate, Memory Cleaner, Site Blocker saved tabs, and recovery. Tab data is processed and stored locally only.
+```
+
+**tabGroups**
+```
+Used to read and restore tab-group membership, title, color, collapsed state, and tab order when users save, suspend, close, or recover grouped tabs. Group metadata is stored locally in chrome.storage.local and is never transmitted off the device.
+```
+
+**history**
+```
+Used for the user-triggered Recover from Chrome history feature and the optional Site Blocker helper for finding previously visited pages. The extension searches Chrome history locally only when the user starts these actions. It does not delete, upload, sell, or use history for advertising or profiling.
+```
+
+**alarms**
+```
+Used to schedule periodic local checks for inactive tabs, automatic tab hibernation, Site Blocker focus schedules, and retention of recovery backups. Alarms are not used for analytics, advertising, or remote communication.
+```
+
+**storage**
+```
+Used to save settings and local feature state, including per-site Swiss Lens preferences, blocklists and schedules, tab activity timestamps, suspended-tab records, saved sessions, recovery indexes, and Page Capture workflow data. This information remains on the user's device.
+```
+
+**unlimitedStorage**
+```
+Used to prevent loss of local recovery data and page captures when users have large browsing sessions with hundreds or thousands of tabs. Stored data can include URLs, titles, tab-group metadata, suspended-tab records, capture data, and rolling daily session snapshots. Old snapshots are automatically removed; data is never transmitted off the device.
+```
+
+**bookmarks**
+```
+Used to create and manage dedicated local bookmark folders for Tab Hibernate backups, blocked-tab saves, and emergency session recovery. Backups are created by explicit user actions or when Site Blocker saves a tab for later restoration. Bookmark data is not uploaded or used for advertising or profiling.
+```
+
+**scripting**
+```
+Used to inject the packaged Page Capture helper into the active tab only after the user starts a capture. The helper measures and scrolls the page so visible sections can be captured and combined locally. No remote script is downloaded or executed.
+```
+
+**downloads**
+```
+Used to save PNG or PDF files generated by Page Capture to the user's Downloads folder or chosen location. A download starts only after the user requests an export. Downloaded files are created locally and are not uploaded to the developer.
+```
+
+**sidePanel**
+```
+Used to provide the extension's primary interface in Chrome's side panel, where users access tab search, readability settings, Page Capture, Tab Hibernate, Memory Cleaner, Site Blocker, and Site Data Clear.
+```
+
+**activeTab**
+```
+Used to obtain temporary access to the current tab when the user starts a page-specific action, such as Page Capture or clearing data for the current site. Access is used only to perform the requested action and is not transmitted off the device.
+```
+
+**browsingData**
+```
+Used by Site Data Clear to remove only the data types selected by the user, such as cookies, local storage, session storage, and cache, for the current site. Removal occurs only after explicit user confirmation. The extension does not read or upload the contents of this data.
+```
+
+**declarativeNetRequest**
+```
+Used by Site Blocker to apply packaged filter rules and the user's local blocklist or allowlist. Rules block configured distracting sites and optional ad/tracker requests. No remote rules are downloaded, and request data is not sent to the developer.
+```
+
+**webNavigation**
+```
+Used to read the main-frame http(s) URL immediately before Site Blocker replaces a blocked navigation with a Chrome error page. This preserves the original URL so the tab can be saved, shown as a restorable placeholder, grouped, or recovered later. The URL is stored locally only and is never transmitted off the device.
+```
+
+**Host permission (`<all_urls>`)**
+```
+Required because the user may use Rigi Extensions on any http(s) website. It lets the packaged Swiss Lens content script apply user-selected readability settings, Page Capture capture the requested page, Site Blocker enforce local rules, and current-site tools identify the active origin. Page content and URLs are processed locally and are not sent to the developer.
+```
+
+**Remote code** — select **No**. All JavaScript and other executable code is included in the submitted extension package; no remote code is downloaded or executed.
 
 ---
 
@@ -264,5 +331,5 @@ Read/update tab group title, color, and membership when the user saves or restor
 ./scripts/package-swiss-extensions-store.sh
 ```
 
-Архив Store: `dist/SwissExtensions-v1.5.50-chrome-store.zip`
-Сайт (Load unpacked): `downloads/SwissExtensions-v1.5.50.zip`
+Архив Store: `dist/RigiExtensions-v1.5.52-chrome-store.zip`
+Сайт (ZIP): `downloads/RigiExtensions-v1.5.52.zip`

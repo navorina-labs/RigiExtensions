@@ -1,8 +1,8 @@
-# Swiss Extensions
+# Rigi Extensions
 
 Chrome MV3 extension: Swiss Command, Swiss Lens, Page Capture, Tab Hibernate, Memory Cleaner, Site Blocker, and Site Data Clear.
 
-**Version:** see `manifest.json` (current: 1.5.50).
+**Version:** see `manifest.json` (current: 1.5.52).
 
 ## Structure
 
@@ -24,7 +24,7 @@ Chrome MV3 extension: Swiss Command, Swiss Lens, Page Capture, Tab Hibernate, Me
 ./scripts/package-swiss-extensions-store.sh
 ```
 
-Output: `dist/SwissExtensions-v<version>-chrome-store.zip` and `../downloads/SwissExtensions-v<version>.zip` (no `.md`, `_metadata/`, `scripts/`, `tests/`, or `dist/`).
+Output: `dist/RigiExtensions-v<version>-chrome-store.zip` and `../downloads/RigiExtensions-v<version>.zip` (no `.md`, `_metadata/`, `scripts/`, `tests/`, or `dist/`).
 
 ## Docs
 

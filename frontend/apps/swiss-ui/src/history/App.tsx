@@ -225,7 +225,7 @@ export function HistoryApp() {
     if (!snapshot) return
     if (
       !window.confirm(
-        `Restore the session from ${snapshot.date}? Existing tabs will be regrouped and only missing URLs will be opened.`
+        `Restore the current session backup? Existing tabs will be regrouped and only missing URLs will be opened.`
       )
     ) return
     setOpening(true)
@@ -418,9 +418,9 @@ export function HistoryApp() {
         />
         <section className="mt-4 max-w-2xl rounded-xl bg-card p-4">
           <div className="mb-3">
-            <h2 className="text-sm font-medium">Daily session recovery</h2>
+            <h2 className="text-sm font-medium">Session backup</h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              One recovery point per day, including tab groups. The newest 30 days are kept automatically.
+              One backup of the open session, including tab groups. The next save replaces it.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">

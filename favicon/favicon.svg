@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="6" fill="#d52b1e" />
-  <path d="M13 6h6v7h7v6h-7v7h-6v-7H6v-6h7V6Z" fill="#fff" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Rigi Extensions">
+  <rect x="16" y="16" width="96" height="96" rx="24" fill="#D52B1E"/>
+  <path d="M27 91 49 73l17-32 12 23 23 27H27Z" fill="#FFF"/>
+  <path d="m49 73 17-32 12 23 9 10-10-6-11-16-10 24Z" fill="#D52B1E"/>
 </svg>

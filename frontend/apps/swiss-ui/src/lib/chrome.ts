@@ -63,10 +63,20 @@ export function installDevChromeMock() {
     storage: {
       local,
       onChanged: {
-        addListener(listener: (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => void) {
+        addListener(
+          listener: (
+            changes: Record<string, chrome.storage.StorageChange>,
+            areaName: string
+          ) => void
+        ) {
           listeners.add(listener)
         },
-        removeListener(listener: (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => void) {
+        removeListener(
+          listener: (
+            changes: Record<string, chrome.storage.StorageChange>,
+            areaName: string
+          ) => void
+        ) {
           listeners.delete(listener)
         },
       },
@@ -74,7 +84,10 @@ export function installDevChromeMock() {
     runtime: {
       lastError: undefined,
       getURL: (path: string) =>
-        new URL(path.replace(/^\//, ""), `${window.location.origin}/`).toString(),
+        new URL(
+          path.replace(/^\//, ""),
+          `${window.location.origin}/`
+        ).toString(),
       sendMessage(
         message: Record<string, unknown>,
         callback: (response: Record<string, unknown>) => void
@@ -83,20 +96,40 @@ export function installDevChromeMock() {
         const response =
           type === "discardBackgroundTabs"
             ? { discarded: 3 }
-            : type === "capture"
-              ? { ok: true, count: 1 }
-              : type === "saveBlockedTabsNow"
-                ? { count: 0 }
-                : { ok: true }
+            : type === "refreshSuspendedFavicons"
+              ? { started: true, running: true, done: 0, total: 3 }
+              : type === "capture"
+                ? { ok: true, count: 1 }
+                : type === "saveBlockedTabsNow"
+                  ? { count: 0 }
+                  : { ok: true }
         window.setTimeout(() => callback(response), 80)
       },
     },
     tabs: {
       create: async () => undefined,
       query: async () => [
-        { id: 1, windowId: 1, title: "Swiss Extensions", url: "https://github.com/navorina-labs/SwissExtensions", active: true },
-        { id: 2, windowId: 1, title: "Chrome Extensions documentation", url: "https://developer.chrome.com/docs/extensions", active: false },
-        { id: 3, windowId: 1, title: "Design notes", url: "https://www.notion.so/design-notes", active: false },
+        {
+          id: 1,
+          windowId: 1,
+          title: "Rigi Extensions",
+          url: "https://github.com/navorina-labs/SwissExtensions",
+          active: true,
+        },
+        {
+          id: 2,
+          windowId: 1,
+          title: "Chrome Extensions documentation",
+          url: "https://developer.chrome.com/docs/extensions",
+          active: false,
+        },
+        {
+          id: 3,
+          windowId: 1,
+          title: "Design notes",
+          url: "https://www.notion.so/design-notes",
+          active: false,
+        },
       ],
       update: async () => undefined,
       reload: async () => undefined,
@@ -107,16 +140,35 @@ export function installDevChromeMock() {
     },
     bookmarks: {
       search: async () => [
-        { id: "b1", title: "Swiss typography", url: "https://www.typography.com/" },
+        {
+          id: "b1",
+          title: "Swiss typography",
+          url: "https://www.typography.com/",
+        },
       ],
       getRecent: async () => [
-        { id: "b1", title: "Swiss typography", url: "https://www.typography.com/", dateAdded: Date.now() },
-        { id: "b2", title: "Chrome Web Store", url: "https://chromewebstore.google.com/", dateAdded: Date.now() - 60_000 },
+        {
+          id: "b1",
+          title: "Swiss typography",
+          url: "https://www.typography.com/",
+          dateAdded: Date.now(),
+        },
+        {
+          id: "b2",
+          title: "Chrome Web Store",
+          url: "https://chromewebstore.google.com/",
+          dateAdded: Date.now() - 60_000,
+        },
       ],
     },
     history: {
       search: async () => [
-        { id: "h1", title: "Chrome Extensions", url: "https://developer.chrome.com/docs/extensions", lastVisitTime: Date.now() - 120_000 },
+        {
+          id: "h1",
+          title: "Chrome Extensions",
+          url: "https://developer.chrome.com/docs/extensions",
+          lastVisitTime: Date.now() - 120_000,
+        },
       ],
     },
     browsingData: {
